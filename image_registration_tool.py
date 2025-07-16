@@ -1,7 +1,7 @@
 import sys
 import typing
 import numpy as np
-from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtCore import Qt, QPointF, QRectF
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsTextItem,
     QToolBar, QFileDialog, QInputDialog, QLineEdit, QMessageBox
@@ -309,9 +309,11 @@ class Image_Window(QMainWindow):
 
         self.statusBar()
 
-    def open_image(self):
-        options = QFileDialog.Option.DontUseNativeDialog
-        file_name, _ = QFileDialog.getOpenFileName(self, "Open Image File", "", "Images (*.png *.jpg *.bmp *.gif *.tif);;All Files (*)", options=options)
+    def open_image(self, file_name=None):
+        if not file_name:
+            options = QFileDialog.Option.DontUseNativeDialog
+            file_name, _ = QFileDialog.getOpenFileName(self, "Open Image File", "", "Images (*.png *.jpg *.bmp *.gif *.tif);;All Files (*)", options=options)
+        
         if file_name:
             basename = os.path.basename(file_name)
             folder_name, _ = os.path.splitext(basename)
@@ -320,28 +322,37 @@ class Image_Window(QMainWindow):
             self.viewer.load_image(file_name)
 
     def save_coordinates_image(self):
-        options = QFileDialog.Option.DontUseNativeDialog
-        file_name, _ = QFileDialog.getSaveFileName(self, "Save Image with Coordinates", f"{self.folder_name}", "Images (*.png *.jpg *.bmp);;All Files (*)", options=options)
-        if file_name:
-            original_matrix = self.viewer.transform()
-
-            self.viewer.resetTransform()
-
-            pixmap = QPixmap(self.viewer.sceneRect().size().toSize())
+        dialog = QFileDialog(self, "Save Image with Coordinates", f"{self.folder_name}")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setNameFilter("Images (*.png *.jpg *.bmp);;All Files (*)")
+        dialog.setDefaultSuffix("png")
+        dialog.setOptions(QFileDialog.Option.DontUseNativeDialog)
+        
+        if dialog.exec():
+            file_name = dialog.selectedFiles()[0]
+            # 뷰의 현재 변환 상태에 영향을 받지 않고 전체 씬을 렌더링하여 정확한 위치에 좌표가 저장되도록 합니다.
+            scene_rect = self.viewer.sceneRect()
+            pixmap = QPixmap(scene_rect.size().toSize())
             pixmap.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(pixmap)
-            self.viewer.render(painter)
-            painter.end()
 
-            self.viewer.setTransform(original_matrix)
+            painter = QPainter(pixmap)
+            # 씬의 특정 영역(scene_rect)을 QPixmap의 특정 영역(pixmap.rect())에 렌더링합니다.
+            self.viewer.scene.render(painter, QRectF(pixmap.rect()), scene_rect)
+            painter.end()
             
             pixmap.save(file_name)
             
     def save_coordinate_txt(self):
-        options = QFileDialog.Option.DontUseNativeDialog
-        file_name, _ = QFileDialog.getSaveFileName(self, "Save txt with Coordinates", f"{self.folder_name}", ".txt (*.txt);;All Files (*)", options=options)
-        if file_name:
-            self.viewer.save_coordinates_to_txt(file_name)
+        dialog = QFileDialog(self, "Save txt with Coordinates", f"{self.folder_name}")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setNameFilter(".txt (*.txt);;All Files (*)")
+        dialog.setDefaultSuffix("txt")
+        dialog.setOptions(QFileDialog.Option.DontUseNativeDialog)
+
+        if dialog.exec():
+            file_name = dialog.selectedFiles()[0]
+            if file_name:
+                self.viewer.save_coordinates_to_txt(file_name)
 
     def zoom_in(self):
         self.viewer.plus_image()
