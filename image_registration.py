@@ -45,8 +45,8 @@ def register_images(img1_path, img2_path, points1, points2):
         transform_matrix: 2x3 affine transformation matrix
     """
     # Read images
-    img1 = cv2.imread(str(img1_path))  # Path 객체를 str로 변환 (안전하게)
-    img2 = cv2.imread(str(img2_path))
+    img1 = imread_unicode(img1_path)
+    img2 = imread_unicode(img2_path)
     
     if img1 is None or img2 is None:
         raise ValueError("Failed to load images")
@@ -99,6 +99,22 @@ def draw_point_matches(overlay_img, points1, points2):
             cv2.LINE_AA
         )
 
+def imread_unicode(path):
+    # np.fromfile로 바이너리 읽고, cv2.imdecode로 디코딩
+    arr = np.fromfile(str(path), np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img
+
+def imwrite_unicode(path, img):
+    # 확장자 추출
+    ext = str(path)[str(path).rfind('.'):]
+    # cv2.imencode로 인코딩 후, np.tofile로 저장
+    result, encoded_img = cv2.imencode(ext, img)
+    if result:
+        encoded_img.tofile(str(path))
+        return True
+    return False
+
 # Parse corresponding points
 reg_file1 = Path('examples/LCM00006_PS3_K3_Siheung_20151009.txt')
 reg_file2 = Path('examples/LCM00006_PS3_K3_Siheung_20190213.txt')
@@ -126,7 +142,7 @@ try:
     print(transform_matrix)
     
     # Optional: 결과 시각화
-    ref_img = cv2.imread(str(img1_path))  # str 변환 추가
+    ref_img = imread_unicode(img1_path)
     ref_img_copy = ref_img.copy()
     registered_img_copy = registered_img.copy()
 
@@ -160,15 +176,15 @@ try:
             cv2.LINE_AA
         )
 
-    cv2.imwrite("reference_image.png", ref_img_copy)
-    cv2.imwrite("registered_image.png", registered_img_copy)
+    imwrite_unicode("reference_image.png", ref_img_copy)
+    imwrite_unicode("registered_image.png", registered_img_copy)
 
     # Overlay image
     overlay_img = cv2.addWeighted(ref_img, 0.5, registered_img, 0.5, 0)
     
     draw_point_matches(overlay_img, points1, registered_points2)
 
-    cv2.imwrite("overlay_image.png", overlay_img)
+    imwrite_unicode("overlay_image.png", overlay_img)
     
 except Exception as e:
     print(f"Error occurred: {str(e)}")
