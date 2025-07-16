@@ -15,7 +15,7 @@ def read_corresponding_points(file_path1, file_path2):
                 if len(parts) >= 3:
                     try:
                         key, x, y = parts[0], float(parts[1]), float(parts[2])
-                        points[key] = [x, y]
+                        points[int(key)] = [x, y]
                     except ValueError:
                         print(f"Skipping invalid line: {line.strip()}")
         return points
