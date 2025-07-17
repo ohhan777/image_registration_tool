@@ -28,7 +28,7 @@ def read_corresponding_points(file_path1, file_path2):
     corresponding_points1 = [points1[k] for k in common_keys]
     corresponding_points2 = [points2[k] for k in common_keys]
 
-    return np.array(corresponding_points1), np.array(corresponding_points2), common_keys
+    return np.array(corresponding_points1), np.array(corresponding_points2)
 
 def register_images(img1_path, img2_path, points1, points2):
     """
@@ -86,15 +86,14 @@ def register_images(img1_path, img2_path, points1, points2):
     
     return transformed_img, transform_matrix, registered_points2, inliers
 
-def draw_point_matches(overlay_img, points1, points2):
+def draw_point_matches(overlay_img, points1, points2, inliers):
     """
     overlay_img: numpy array (이미지)
     points1: (N, 2) 원본 좌표
     points2: (N, 2) 변환(registered)된 좌표
+    inliers: (N,) inlier mask
     """
-    import numpy as np
-    import cv2
-    for idx, ((x1, y1), (x2, y2)) in enumerate(zip(points1, points2), 1):
+    for idx, ((x1, y1), (x2, y2), inlier) in enumerate(zip(points1, points2, inliers), 1):
         dist = np.hypot(x1 - x2, y1 - y2)
         if inlier:
             color = (0, 255, 0)  # Inlier: 녹색
@@ -105,7 +104,18 @@ def draw_point_matches(overlay_img, points1, points2):
         cv2.putText(
             overlay_img,
             str(idx),
-            (int(round(x2)) + 4, int(round(y2)) - 4),
+            (int(round(x2)) + 5, int(round(y2)) - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.3,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA
+        )
+        # 점수(오차) 표시 (노란색)
+        cv2.putText(
+            overlay_img,
+            f"{dist:.1f}",
+            (int(round(x2)) + 4, int(round(y2)) + 7,
             cv2.FONT_HERSHEY_SIMPLEX,
             0.3,
             (0, 255, 255),  # 노란색
@@ -130,18 +140,18 @@ def imwrite_unicode(path, img):
     return False
 
 # Parse corresponding points
-reg_file1 = Path('examples/LCM00006_PS3_K3_Siheung_20151009.txt')
-reg_file2 = Path('examples/LCM00006_PS3_K3_Siheung_20190213.txt')
+reg_file1 = Path('examples/LCM00002_PS3_K3_TAOYUAN_20210407.txt')
+reg_file2 = Path('examples/LCM00002_PS3_K3_TAOYUAN_20221114.txt')
 
 try:
-    points1, points2, common_keys = read_corresponding_points(reg_file1, reg_file2)
+    points1, points2 = read_corresponding_points(reg_file1, reg_file2)
 
     if len(points1) == 0 or len(points2) == 0:
         raise ValueError("No valid points found in one or both files")
 
     # 실제 사용 예시
-    img1_path = Path("C:/Users/tsg03/Desktop/original_image") / reg_file1.name.replace(".txt", ".png")
-    img2_path = Path("C:/Users/tsg03/Desktop/original_image") / reg_file2.name.replace(".txt", ".png")
+    img1_path = Path("examples") / reg_file1.name.replace(".txt", ".png")
+    img2_path = Path("examples") / reg_file2.name.replace(".txt", ".png")
     
     registered_img, transform_matrix, registered_points2, inliers = register_images(
         img1_path,
@@ -168,12 +178,12 @@ try:
     registered_img_copy = registered_img.copy()
 
     # points on the reference image with numbers
-    for key, point in zip(common_keys, points1):
+    for idx, point in enumerate(points1, 1):
         x, y = int(point[0]), int(point[1])
         cv2.circle(ref_img_copy, (x, y), 3, (0, 255, 255), -1)
         cv2.putText(
             ref_img_copy,
-            str(key),
+            str(idx),
             (x + 4, y - 4),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.3,
@@ -183,12 +193,12 @@ try:
         )
     
     # points on the registered image with numbers
-    for key, point in zip(common_keys, registered_points2):
+    for idx, point in enumerate(registered_points2, 1):
         x, y = int(round(point[0])), int(round(point[1]))
         cv2.circle(registered_img_copy, (x, y), 3, (0, 255, 255), -1)
         cv2.putText(
             registered_img_copy,
-            str(key),
+            str(idx),
             (x + 4, y - 4),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.3,
@@ -203,7 +213,7 @@ try:
     # Overlay image
     overlay_img = cv2.addWeighted(ref_img, 0.5, registered_img, 0.5, 0)
     
-    draw_point_matches(overlay_img, points1, registered_points2)
+    draw_point_matches(overlay_img, points1, registered_points2, inliers.ravel())
 
     imwrite_unicode("overlay_image.png", overlay_img)
     
