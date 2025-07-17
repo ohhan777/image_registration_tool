@@ -115,7 +115,7 @@ def draw_point_matches(overlay_img, points1, points2, inliers):
         cv2.putText(
             overlay_img,
             f"{dist:.1f}",
-            (int(round(x2)) + 4, int(round(y2)) + 7,
+            (int(round(x2)) + 4, int(round(y2)) + 7),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.3,
             (0, 255, 255),  # 노란색
