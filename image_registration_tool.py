@@ -188,10 +188,10 @@ class ImageViewer(QGraphicsView):
             return 
         
         with open(file_name, 'w') as file:
-            for i, _ in enumerate(self.number_items):
-                x, y = self.coordinates[i]  
+            for number_item, (x, y) in zip(self.number_items, self.coordinates):
+                label = number_item.toPlainText()
                 if (x, y) != (None, None):
-                    file.write(f"{i+1} {x}, {y}\n")
+                    file.write(f"{label} {x}, {y}\n")
 
     # 저장된 좌표 txt 파일을 호출
     def load_coordinates_from_txt(self, file_name):
