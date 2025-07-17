@@ -43,6 +43,8 @@ def register_images(img1_path, img2_path, points1, points2):
     Returns:
         transformed_img: Registered image
         transform_matrix: 2x3 affine transformation matrix
+        registered_points2: Transformed points2
+        inliers: Inlier mask from RANSAC
     """
     # Read images
     img1 = imread_unicode(img1_path)
@@ -55,8 +57,17 @@ def register_images(img1_path, img2_path, points1, points2):
     src_points = points2.astype(np.float32)
     dst_points = points1.astype(np.float32)
     
-    # Calculate affine transform matrix
-    transform_matrix = cv2.estimateAffinePartial2D(src_points, dst_points)[0]
+    # Calculate affine transform matrix with RANSAC
+    transform_matrix, inliers = cv2.estimateAffinePartial2D(
+        src_points, dst_points,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=3.0,  # Adjust based on image resolution
+        maxIters=2000,
+        confidence=0.995
+    )
+    
+    if transform_matrix is None:
+        raise ValueError("Failed to estimate affine transform")
     
     # Apply affine transform to image2
     transformed_img = cv2.warpAffine(
@@ -68,33 +79,46 @@ def register_images(img1_path, img2_path, points1, points2):
         borderValue=0
     )
 
-    # 포인트 변환: cv2.transform 사용 (2x3 행렬 직접 지원)
+    # Transform points
     points2_reshaped = np.array(points2, dtype=np.float32).reshape(-1, 1, 2)
     registered_points2 = cv2.transform(points2_reshaped, transform_matrix)
     registered_points2 = registered_points2.reshape(-1, 2)
     
-    return transformed_img, transform_matrix, registered_points2
+    return transformed_img, transform_matrix, registered_points2, inliers
 
-def draw_point_matches(overlay_img, points1, points2):
+def draw_point_matches(overlay_img, points1, points2, inliers):
     """
     overlay_img: numpy array (이미지)
     points1: (N, 2) 원본 좌표
     points2: (N, 2) 변환(registered)된 좌표
+    inliers: (N,) inlier mask
     """
-    import numpy as np
-    import cv2
-    for idx, ((x1, y1), (x2, y2)) in enumerate(zip(points1, points2), 1):
+    for idx, ((x1, y1), (x2, y2), inlier) in enumerate(zip(points1, points2, inliers), 1):
         dist = np.hypot(x1 - x2, y1 - y2)
-        color = (0, 255, 0) if dist <= 2.0 else (0, 0, 255)  # 2픽셀 이내: 녹색, 초과: 빨간색
+        if inlier:
+            color = (0, 255, 0)  # Inlier: 녹색
+        else:
+            color = (0, 0, 255)  # Outlier: 빨간색
         cv2.circle(overlay_img, (int(round(x2)), int(round(y2))), 3, color, -1)
-        # 숫자(순서) 표시 (흰색, 점 오른쪽 위)
+        # 숫자 표시 (흰색)
         cv2.putText(
             overlay_img,
             str(idx),
-            (int(round(x2)) + 4, int(round(y2)) - 4),
+            (int(round(x2)) + 5, int(round(y2)) - 5),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.3,
-            (255, 255, 255),  # 흰색 (BGR)
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA
+        )
+        # 점수(오차) 표시 (노란색)
+        cv2.putText(
+            overlay_img,
+            f"{dist:.1f}",
+            (int(round(x2)) + 4, int(round(y2)) + 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.3,
+            (0, 255, 255),  # 노란색
             1,
             cv2.LINE_AA
         )
@@ -116,8 +140,8 @@ def imwrite_unicode(path, img):
     return False
 
 # Parse corresponding points
-reg_file1 = Path('examples/LCM00006_PS3_K3_Siheung_20151009.txt')
-reg_file2 = Path('examples/LCM00006_PS3_K3_Siheung_20190213.txt')
+reg_file1 = Path('examples/LCM00002_PS3_K3_TAOYUAN_20210407.txt')
+reg_file2 = Path('examples/LCM00002_PS3_K3_TAOYUAN_20221114.txt')
 
 try:
     points1, points2 = read_corresponding_points(reg_file1, reg_file2)
@@ -129,7 +153,7 @@ try:
     img1_path = Path("examples") / reg_file1.name.replace(".txt", ".png")
     img2_path = Path("examples") / reg_file2.name.replace(".txt", ".png")
     
-    registered_img, transform_matrix, registered_points2 = register_images(
+    registered_img, transform_matrix, registered_points2, inliers = register_images(
         img1_path,
         img2_path,
         points1,
@@ -137,10 +161,17 @@ try:
     )
     
     # 결과 저장
-    cv2.imwrite("registered_image.png", registered_img)
+    imwrite_unicode("registered_image.png", registered_img)
     print("Affine Transform Matrix:")
     print(transform_matrix)
     
+    # Reprojection Error 계산 및 출력 (매칭 점수로 사용)
+    errors = np.linalg.norm(registered_points2 - points1, axis=1)
+    print("Point Matching Scores (Reprojection Errors):")
+    for idx, (error, inlier) in enumerate(zip(errors, inliers.ravel()), 1):
+        status = "Inlier" if inlier else "Outlier"
+        print(f"Point {idx}: Error = {error:.2f} px, Status = {status}")
+
     # Optional: 결과 시각화
     ref_img = imread_unicode(img1_path)
     ref_img_copy = ref_img.copy()
@@ -182,7 +213,7 @@ try:
     # Overlay image
     overlay_img = cv2.addWeighted(ref_img, 0.5, registered_img, 0.5, 0)
     
-    draw_point_matches(overlay_img, points1, registered_points2)
+    draw_point_matches(overlay_img, points1, registered_points2, inliers.ravel())
 
     imwrite_unicode("overlay_image.png", overlay_img)
     
