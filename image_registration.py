@@ -28,11 +28,11 @@ def read_corresponding_points(file_path1, file_path2):
     corresponding_points1 = [points1[k] for k in common_keys]
     corresponding_points2 = [points2[k] for k in common_keys]
 
-    return np.array(corresponding_points1), np.array(corresponding_points2)
+    return np.array(corresponding_points1), np.array(corresponding_points2), common_keys
 
-def register_images(img1_path, img2_path, points1, points2):
+def register_images(img1_path, img2_path, points1, points2, keys=None):
     """
-    Register image2 to image1 using affine transform
+    Register image2 to image1 using homography transform
     
     Args:
         img1_path: Path to reference image
@@ -42,7 +42,7 @@ def register_images(img1_path, img2_path, points1, points2):
     
     Returns:
         transformed_img: Registered image
-        transform_matrix: 2x3 affine transformation matrix
+        transform_matrix: 3x3 homography transformation matrix
         registered_points2: Transformed points2
         inliers: Inlier mask from RANSAC
     """
@@ -57,20 +57,20 @@ def register_images(img1_path, img2_path, points1, points2):
     src_points = points2.astype(np.float32)
     dst_points = points1.astype(np.float32)
     
-    # Calculate affine transform matrix with RANSAC
-    transform_matrix, inliers = cv2.estimateAffinePartial2D(
+    # Calculate homography matrix with RANSAC
+    transform_matrix, inliers = cv2.findHomography(
         src_points, dst_points,
         method=cv2.RANSAC,
-        ransacReprojThreshold=3.0,  # Adjust based on image resolution
+        ransacReprojThreshold=3.5,  # Adjust based on image resolution
         maxIters=2000,
         confidence=0.995
     )
     
     if transform_matrix is None:
-        raise ValueError("Failed to estimate affine transform")
+        raise ValueError("Failed to estimate homography transform")
     
-    # Apply affine transform to image2
-    transformed_img = cv2.warpAffine(
+    # Apply perspective transform to image2
+    transformed_img = cv2.warpPerspective(
         img2,
         transform_matrix,
         (img1.shape[1], img1.shape[0]),
@@ -81,19 +81,20 @@ def register_images(img1_path, img2_path, points1, points2):
 
     # Transform points
     points2_reshaped = np.array(points2, dtype=np.float32).reshape(-1, 1, 2)
-    registered_points2 = cv2.transform(points2_reshaped, transform_matrix)
+    registered_points2 = cv2.perspectiveTransform(points2_reshaped, transform_matrix)
     registered_points2 = registered_points2.reshape(-1, 2)
     
-    return transformed_img, transform_matrix, registered_points2, inliers
+    return transformed_img, transform_matrix, registered_points2, inliers, keys
 
-def draw_point_matches(overlay_img, points1, points2, inliers):
+def draw_point_matches(overlay_img, points1, points2, inliers, keys=None):
     """
     overlay_img: numpy array (이미지)
     points1: (N, 2) 원본 좌표
     points2: (N, 2) 변환(registered)된 좌표
     inliers: (N,) inlier mask
     """
-    for idx, ((x1, y1), (x2, y2), inlier) in enumerate(zip(points1, points2, inliers), 1):
+    for i, ((x1, y1), (x2, y2), inlier) in enumerate(zip(points1, points2, inliers)):
+        idx = keys[i] if keys is not None else i + 1
         dist = np.hypot(x1 - x2, y1 - y2)
         if inlier:
             color = (0, 255, 0)  # Inlier: 녹색
@@ -144,7 +145,7 @@ reg_file1 = Path('examples/LCM00002_PS3_K3_TAOYUAN_20210407.txt')
 reg_file2 = Path('examples/LCM00002_PS3_K3_TAOYUAN_20221114.txt')
 
 try:
-    points1, points2 = read_corresponding_points(reg_file1, reg_file2)
+    points1, points2, common_keys = read_corresponding_points(reg_file1, reg_file2)
 
     if len(points1) == 0 or len(points2) == 0:
         raise ValueError("No valid points found in one or both files")
@@ -153,22 +154,24 @@ try:
     img1_path = Path("examples") / reg_file1.name.replace(".txt", ".png")
     img2_path = Path("examples") / reg_file2.name.replace(".txt", ".png")
     
-    registered_img, transform_matrix, registered_points2, inliers = register_images(
+    registered_img, transform_matrix, registered_points2, inliers, keys = register_images(
         img1_path,
         img2_path,
         points1,
-        points2
+        points2,
+        common_keys
     )
     
     # 결과 저장
     imwrite_unicode("registered_image.png", registered_img)
-    print("Affine Transform Matrix:")
+    print("Homography Transform Matrix:")
     print(transform_matrix)
     
     # Reprojection Error 계산 및 출력 (매칭 점수로 사용)
     errors = np.linalg.norm(registered_points2 - points1, axis=1)
     print("Point Matching Scores (Reprojection Errors):")
-    for idx, (error, inlier) in enumerate(zip(errors, inliers.ravel()), 1):
+    for i, (error, inlier) in enumerate(zip(errors, inliers.ravel())):
+        idx = common_keys[i]
         status = "Inlier" if inlier else "Outlier"
         print(f"Point {idx}: Error = {error:.2f} px, Status = {status}")
 
@@ -178,7 +181,8 @@ try:
     registered_img_copy = registered_img.copy()
 
     # points on the reference image with numbers
-    for idx, point in enumerate(points1, 1):
+    for i, point in enumerate(points1):
+        idx = common_keys[i]
         x, y = int(point[0]), int(point[1])
         cv2.circle(ref_img_copy, (x, y), 3, (0, 255, 255), -1)
         cv2.putText(
@@ -193,7 +197,8 @@ try:
         )
     
     # points on the registered image with numbers
-    for idx, point in enumerate(registered_points2, 1):
+    for i, point in enumerate(registered_points2):
+        idx = common_keys[i]
         x, y = int(round(point[0])), int(round(point[1]))
         cv2.circle(registered_img_copy, (x, y), 3, (0, 255, 255), -1)
         cv2.putText(
@@ -213,7 +218,7 @@ try:
     # Overlay image
     overlay_img = cv2.addWeighted(ref_img, 0.5, registered_img, 0.5, 0)
     
-    draw_point_matches(overlay_img, points1, registered_points2, inliers.ravel())
+    draw_point_matches(overlay_img, points1, registered_points2, inliers.ravel(), common_keys)
 
     imwrite_unicode("overlay_image.png", overlay_img)
     
