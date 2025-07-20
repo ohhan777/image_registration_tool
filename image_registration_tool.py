@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsTextItem,
     QToolBar, QFileDialog, QInputDialog, QLineEdit, QMessageBox
 )
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QIcon, QAction
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QIcon, QAction, QKeySequence
 from PIL import Image, ImageDraw, ImageFont
 import os
 
@@ -18,9 +18,12 @@ class ImageViewer(QGraphicsView):
         # 이미지의 중심을 중심으로 확대/축소하도록 설정
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         # 마우스 휠 이벤트 핸들링
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # 마우스 추적 활성화
+        self.setMouseTracking(True)
 
     def init_ui(self):
         self.scene = QGraphicsScene(self)
@@ -36,6 +39,13 @@ class ImageViewer(QGraphicsView):
         self.min_zoom = 0.05
         self.max_zoom = 2.0
         self.setMinimumSize(400, 400)
+        
+        # 드래그 스크롤 관련 변수
+        self.last_pan_point = None
+        self.is_panning = False
+        
+        # Undo 관련 변수
+        self.undo_stack = []
 
     def load_image(self, file_name):
         self.scene.clear()
@@ -103,8 +113,15 @@ class ImageViewer(QGraphicsView):
             # 클릭한 좌표 주변에 있는 좌표를 삭제
             if self.remove_coordinates(pos):
                 return
+        elif event.button() == Qt.MouseButton.MiddleButton:
+            # 중간 마우스 버튼으로 패닝 시작
+            self.last_pan_point = event.position().toPoint()
+            self.is_panning = True
 
     def Click_Coordinate(self, pos):
+        # Undo를 위한 현재 상태 저장
+        self.save_state_for_undo()
+        
         cross_size = 7
         pen = QPen(QColor(255, 0, 0))
         cross_item1 = QGraphicsLineItem(pos.x() - cross_size / 2, pos.y(), pos.x() + cross_size / 2, pos.y())
@@ -156,10 +173,109 @@ class ImageViewer(QGraphicsView):
         for i, (x, y) in enumerate(self.coordinates):
             distance = (x - pos.x())**2 + (y - pos.y())**2
             if distance < 9:
+                # Undo를 위한 현재 상태 저장
+                self.save_state_for_undo()
                 self.remove_cross_one_item(i)
                 self.coordinates.pop(i)
                 return True
         return False
+    
+    # Undo 기능을 위한 상태 저장
+    def save_state_for_undo(self):
+        state = {
+            'coordinates': self.coordinates.copy(),
+            'number_count': self.number_count,
+            'cross_items_data': [],
+            'number_items_data': []
+        }
+        
+        # 크로스 아이템들의 데이터 저장
+        for i in range(0, len(self.cross_items), 2):
+            if i + 1 < len(self.cross_items):
+                cross1 = self.cross_items[i]
+                cross2 = self.cross_items[i + 1]
+                state['cross_items_data'].append({
+                    'cross1_line': cross1.line(),
+                    'cross2_line': cross2.line()
+                })
+        
+        # 숫자 아이템들의 데이터 저장
+        for item in self.number_items:
+            state['number_items_data'].append({
+                'text': item.toPlainText(),
+                'pos': item.pos()
+            })
+        
+        self.undo_stack.append(state)
+        # Undo 스택 크기 제한 (메모리 절약)
+        if len(self.undo_stack) > 50:
+            self.undo_stack.pop(0)
+    
+    # Undo 기능 실행
+    def undo(self):
+        if not self.undo_stack:
+            return
+        
+        # 현재 모든 아이템 제거
+        for item in self.cross_items:
+            self.scene.removeItem(item)
+        for item in self.number_items:
+            self.scene.removeItem(item)
+        
+        # 이전 상태 복원
+        state = self.undo_stack.pop()
+        self.coordinates = state['coordinates']
+        self.number_count = state['number_count']
+        self.cross_items = []
+        self.number_items = []
+        
+        # 크로스 아이템들 복원
+        pen = QPen(QColor(255, 0, 0))
+        for cross_data in state['cross_items_data']:
+            cross_item1 = QGraphicsLineItem(cross_data['cross1_line'])
+            cross_item2 = QGraphicsLineItem(cross_data['cross2_line'])
+            cross_item1.setPen(pen)
+            cross_item2.setPen(pen)
+            self.cross_items.append(cross_item1)
+            self.cross_items.append(cross_item2)
+            self.scene.addItem(cross_item1)
+            self.scene.addItem(cross_item2)
+        
+        # 숫자 아이템들 복원
+        for number_data in state['number_items_data']:
+            number_item = QGraphicsTextItem(number_data['text'])
+            number_item.setPos(number_data['pos'])
+            number_item.setDefaultTextColor(QColor(Qt.GlobalColor.red))
+            font = QFont()
+            font.setPointSize(7)
+            number_item.setFont(font)
+            self.number_items.append(number_item)
+            self.scene.addItem(number_item)
+    
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Z and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.undo()
+        else:
+            super().keyPressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.is_panning and self.last_pan_point is not None:
+            # 드래그 거리 계산
+            delta = event.position().toPoint() - self.last_pan_point
+            self.last_pan_point = event.position().toPoint()
+            
+            # 스크롤바 이동
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+        
+        super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self.is_panning = False
+            self.last_pan_point = None
+        
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event):
         # 마우스 휠 이벤트를 감지하여 이미지 확대/축소
@@ -252,7 +368,10 @@ class Image_Window(QMainWindow):
         self.setWindowIcon(QIcon('./icon/earth.png'))
         self.move(0, 0)
         self.setFixedSize(1000, 1000)
-
+        
+        # 키보드 포커스 설정
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        
         self.create_toolbar()
 
     def create_toolbar(self):
@@ -374,6 +493,12 @@ class Image_Window(QMainWindow):
             coord_file, _ = QFileDialog.getOpenFileName(self, "좌표 파일 열기", "", ".txt (*.txt);;모든 파일 (*)", options=options)
             if coord_file:
                 self.viewer.load_coordinates_from_txt(coord_file)
+    
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Z and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.viewer.undo()
+        else:
+            super().keyPressEvent(event)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
