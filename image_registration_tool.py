@@ -97,6 +97,12 @@ class ImageViewer(QGraphicsView):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # Ctrl 키가 눌려있으면 패닝 모드로 전환
+            if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+                self.last_pan_point = event.position().toPoint()
+                self.is_panning = True
+                return
+                
             pos = self.mapToScene(event.position().toPoint())
 
             # 사용자가 이미 존재하는 숫자 레이블을 클릭했는지 확인합니다.
@@ -272,6 +278,10 @@ class ImageViewer(QGraphicsView):
     
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
+            self.is_panning = False
+            self.last_pan_point = None
+        elif event.button() == Qt.MouseButton.LeftButton and self.is_panning:
+            # Ctrl+왼쪽 클릭 드래그 종료
             self.is_panning = False
             self.last_pan_point = None
         
