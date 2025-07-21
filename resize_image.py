@@ -20,9 +20,10 @@ def imwrite_unicode(path, img):
 
 def process_image_to_1024(img):
     """
-    이미지를 1024x1024로 처리하는 함수
-    - 이미지가 1024x1024보다 크면 중앙에서 1:1 aspect ratio로 자르고 1024x1024로 다운스케일
-    - 이미지가 1024x1024보다 작으면 중앙을 기준으로 1:1 aspect ratio로 만들고 1024x1024로 업스케일
+    이미지를 1024x1024 정사각형으로 처리하는 함수
+    - 이미지가 1024x1024보다 크면 중앙에서 정사각형으로 자르고 1024x1024로 다운스케일
+    - 이미지가 1024x1024보다 작으면 중앙을 기준으로 정사각형으로 만들고 1024x1024로 업스케일
+    - 결과는 항상 1024x1024 정사각형 (aspect ratio 1:1)
     """
     target_size = 1024
     height, width = img.shape[:2]
@@ -31,7 +32,7 @@ def process_image_to_1024(img):
     center_x = width // 2
     center_y = height // 2
     
-    # 1:1 aspect ratio를 위해 더 큰 차원을 기준으로 정사각형 생성
+    # 정사각형을 위해 더 큰 차원을 기준으로 설정
     # 이렇게 하면 고해상도 이미지에서 최대한의 정보를 보존
     square_size = max(height, width)
     
@@ -66,7 +67,7 @@ def process_image_to_1024(img):
         # 이미 정사각형인 경우
         square_img = img[start_y:end_y, start_x:end_x]
     
-    # 1024x1024로 리사이즈
+    # 1024x1024 정사각형으로 리사이즈
     resized_img = cv2.resize(square_img, (target_size, target_size), interpolation=cv2.INTER_LANCZOS4)
     return resized_img
 
