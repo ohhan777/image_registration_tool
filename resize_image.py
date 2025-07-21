@@ -34,7 +34,7 @@ def process_image_to_1024(img):
     
     # 정사각형을 위해 더 큰 차원을 기준으로 설정
     # 이렇게 하면 고해상도 이미지에서 최대한의 정보를 보존
-    square_size = max(height, width)
+    square_size = min(height, width)
     
     # 정사각형 영역의 시작과 끝 좌표 계산
     half_size = square_size // 2
@@ -71,7 +71,7 @@ def process_image_to_1024(img):
     resized_img = cv2.resize(square_img, (target_size, target_size), interpolation=cv2.INTER_LANCZOS4)
     return resized_img
 
-filename = Path('LCM00001_PS3_K3_Siheung_20151009_Google.png')
+filename = Path('ttest4k.jpg')
 img = imread_unicode(filename)
 
 # 이미지를 1024x1024로 처리
