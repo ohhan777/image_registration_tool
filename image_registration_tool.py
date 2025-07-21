@@ -713,6 +713,36 @@ if __name__ == '__main__':
             overlay_window = Image_Window()
             overlay_window.setWindowTitle("Overlay Registration Result")
             overlay_window.viewer.load_from_numpy(overlay_img)
+            
+            # ----- Add Save Overlay button -----
+            overlay_toolbar = overlay_window.findChild(QToolBar)
+            save_overlay_action = QAction(QIcon('./icon/save.png'), 'Save Overlay', overlay_window)
+            save_overlay_action.setStatusTip('Save overlay image')
+            
+            def save_overlay():
+                # Default filename: original Window_two image name + '_overlay.png'
+                default_name = f"{Window_two.folder_name}_overlay.png" if Window_two.folder_name else 'overlay.png'
+                dialog = QFileDialog(overlay_window, 'Save Overlay Image', default_name)
+                dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+                dialog.setNameFilter('Images (*.png *.jpg *.bmp);;All Files (*)')
+                dialog.setDefaultSuffix('png')
+                dialog.setOptions(QFileDialog.Option.DontUseNativeDialog)
+                if dialog.exec():
+                    file_name = dialog.selectedFiles()[0]
+                    # Get pixmap from viewer and save
+                    pixmap = overlay_window.viewer.image_item.pixmap()
+                    pixmap.save(file_name)
+            
+            save_overlay_action.triggered.connect(save_overlay)
+            if overlay_toolbar is not None:
+                overlay_toolbar.addAction(save_overlay_action)
+            else:
+                # If no toolbar found (shouldn't happen), create one
+                new_toolbar = QToolBar("overlay_toolbar", overlay_window)
+                overlay_window.addToolBar(new_toolbar)
+                new_toolbar.addAction(save_overlay_action)
+            # ----- End Save Overlay button -----
+            
             overlay_window.show()
             active_overlays.append(overlay_window)
         except Exception as e:
