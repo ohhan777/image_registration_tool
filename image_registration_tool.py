@@ -10,6 +10,9 @@ from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QIcon, QAction, 
 from PIL import Image, ImageDraw, ImageFont
 import os
 
+import cv2
+from PyQt6.QtGui import QImage
+
 class ImageViewer(QGraphicsView):
     def __init__(self):
         super().__init__()
@@ -60,6 +63,25 @@ class ImageViewer(QGraphicsView):
 
             self.setSceneRect(pixmap.rect().x(), pixmap.rect().y(), pixmap.rect().width(), pixmap.rect().height())
             self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        try:
+            update_registration_button()
+        except NameError:
+            pass
+
+    def load_from_numpy(self, np_img):
+        img_rgb = cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB)
+        height, width, _ = img_rgb.shape
+        bytes_per_line = 3 * width
+        qimage = QImage(img_rgb.tobytes(), width, height, bytes_per_line, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimage)
+        self.scene.clear()
+        self.cross_items.clear()
+        self.number_items.clear()
+        self.coordinates.clear()
+        self.image_item = QGraphicsPixmapItem(pixmap)
+        self.scene.addItem(self.image_item)
+        self.setSceneRect(QRectF(pixmap.rect()))
+        self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     # 좌표 저장
     def save_coordinates_image(self, file_name):
@@ -85,6 +107,10 @@ class ImageViewer(QGraphicsView):
             draw.text((int(x) + 5, int(y) - 5), f"{i}", fill=(255, 0, 0), font=font)
 
         image.save(file_name)
+        try:
+            update_registration_button()
+        except NameError:
+            pass
 
     def plus_image(self):
         self.zoom_factor += self.zoom_step
@@ -151,6 +177,10 @@ class ImageViewer(QGraphicsView):
         self.number_items.append(number_item)
         self.number_count += 1
         self.coordinates.append(((pos.x()), (pos.y())))
+        try:
+            update_registration_button()
+        except NameError:
+            pass
 
     # 좌표 전체 삭제
     def remove_cross_items(self):
@@ -163,6 +193,10 @@ class ImageViewer(QGraphicsView):
         self.number_items = []    
         self.cross_items = []
         self.number_count = 0
+        try:
+            update_registration_button()
+        except NameError:
+            pass
 
     def remove_cross_one_item(self, index):
         if 0 <= index < len(self.cross_items) and 0 <= index < len(self.number_items):
@@ -173,6 +207,10 @@ class ImageViewer(QGraphicsView):
             self.scene.removeItem(self.number_items[index])
             self.number_items.pop(index)
             self.number_count -= 1
+        try:
+            update_registration_button()
+        except NameError:
+            pass
 
     # 좌표 개별 삭제
     def remove_coordinates(self, pos):
@@ -183,6 +221,10 @@ class ImageViewer(QGraphicsView):
                 self.save_state_for_undo()
                 self.remove_cross_one_item(i)
                 self.coordinates.pop(i)
+                try:
+                    update_registration_button()
+                except NameError:
+                    pass
                 return True
         return False
     
@@ -257,7 +299,11 @@ class ImageViewer(QGraphicsView):
             number_item.setFont(font)
             self.number_items.append(number_item)
             self.scene.addItem(number_item)
-    
+        try:
+            update_registration_button()
+        except NameError:
+            pass
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Z and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             self.undo()
@@ -318,6 +364,10 @@ class ImageViewer(QGraphicsView):
                 label = number_item.toPlainText()
                 if (x, y) != (None, None):
                     file.write(f"{label} {x}, {y}\n")
+        try:
+            update_registration_button()
+        except NameError:
+            pass
 
     # 저장된 좌표 txt 파일을 호출
     def load_coordinates_from_txt(self, file_name):
@@ -327,6 +377,10 @@ class ImageViewer(QGraphicsView):
                 if len(data) == 3:
                     index, x, y = int(data[0]), float(data[1].replace(',','')), float(data[2].replace(',',''))
                     self.add_coordinate_img(index, x, y)
+        try:
+            update_registration_button()
+        except NameError:
+            pass
 
     # 호출된 좌표 데이터 txt 파일 기반으로 이미지 작성
     def add_coordinate_img(self, index, x, y):
@@ -354,6 +408,10 @@ class ImageViewer(QGraphicsView):
         self.number_items.append(number_item)
         self.number_count += 1
         self.coordinates.append(((pos.x()), (pos.y())))
+        try:
+            update_registration_button()
+        except NameError:
+            pass
 
     # 레이블 변경
     def modify_coordinate_label(self, index, new_label):
@@ -362,8 +420,77 @@ class ImageViewer(QGraphicsView):
                 new_label = int(new_label)
                 self.number_count = max(self.number_count, new_label)  # number_count가 적어도 new_label만큼 커지도록 합니다.
                 self.number_items[index].setPlainText(str(new_label))
+                try:
+                    update_registration_button()
+                except NameError:
+                    pass
             except ValueError:
                 QMessageBox.warning(self, '잘못된 입력', '레이블에는 정수 값을 입력하세요.')
+
+def register_images(img1, img2, points1, points2, keys):
+    if img1 is None or img2 is None:
+        raise ValueError("Images not loaded")
+    
+    src_points = points2.astype(np.float32)
+    dst_points = points1.astype(np.float32)
+    
+    transform_matrix, inliers = cv2.findHomography(
+        src_points, dst_points,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=3.5,
+        maxIters=2000,
+        confidence=0.995
+    )
+    
+    if transform_matrix is None:
+        raise ValueError("Failed to estimate homography transform")
+    
+    transformed_img = cv2.warpPerspective(
+        img2,
+        transform_matrix,
+        (img1.shape[1], img1.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
+    )
+
+    points2_reshaped = np.array(points2, dtype=np.float32).reshape(-1, 1, 2)
+    registered_points2 = cv2.perspectiveTransform(points2_reshaped, transform_matrix)
+    registered_points2 = registered_points2.reshape(-1, 2)
+    
+    return transformed_img, transform_matrix, registered_points2, inliers, keys
+
+def draw_point_matches(overlay_img, points1, points2, inliers, keys=None):
+    for i, ((x1, y1), (x2, y2), inlier) in enumerate(zip(points1, points2, inliers)):
+        idx = keys[i] if keys is not None else i + 1
+        dist = np.hypot(x1 - x2, y1 - y2)
+        if inlier:
+            color = (0, 255, 0)  # Inlier: 녹색
+        else:
+            color = (0, 0, 255)  # Outlier: 빨간색
+        cv2.circle(overlay_img, (int(round(x2)), int(round(y2))), 3, color, -1)
+        # 숫자 표시 (흰색)
+        cv2.putText(
+            overlay_img,
+            str(idx),
+            (int(round(x2)) + 5, int(round(y2)) - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.3,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA
+        )
+        # 점수(오차) 표시 (노란색)
+        cv2.putText(
+            overlay_img,
+            f"{dist:.1f}",
+            (int(round(x2)) + 4, int(round(y2)) + 7),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.3,
+            (0, 255, 255),  # 노란색
+            1,
+            cv2.LINE_AA
+        )
 
 class Image_Window(QMainWindow):
     def __init__(self):
@@ -521,14 +648,77 @@ if __name__ == '__main__':
     Window_two.move(350, 0)
     Window_two.show()
 
-    # Window_three = Image_Window()
-    # Window_three.setWindowTitle("Image Registration Tool_3")
-    # Window_three.move(700, 0)
-    # Window_three.show()
+    active_overlays = []
 
-    # Window_four = Image_Window()
-    # Window_four.setWindowTitle("Image Registration Tool_4")
-    # Window_four.move(1050, 0)
-    # Window_four.show()
+    def get_common_count():
+        try:
+            points1_dict = {int(n.toPlainText()): list(c) for n, c in zip(Window_one.viewer.number_items, Window_one.viewer.coordinates)}
+            points2_dict = {int(n.toPlainText()): list(c) for n, c in zip(Window_two.viewer.number_items, Window_two.viewer.coordinates)}
+            return len(set(points1_dict) & set(points2_dict))
+        except:
+            return 0
+
+    def update_registration_button():
+        reg_action.setEnabled(get_common_count() >= 5)
+
+    # Add registration button to Window_two's toolbar
+    toolbar = Window_two.findChild(QToolBar)
+    pixmap = QPixmap(24, 24)
+    pixmap.fill(QColor(255, 255, 255))
+    painter = QPainter(pixmap)
+    painter.setPen(QColor(0, 0, 0))
+    font = QFont()
+    font.setBold(True)
+    painter.setFont(font)
+    painter.drawText(QRectF(0, 0, 24, 24), Qt.AlignmentFlag.AlignCenter, "R")
+    painter.end()
+    icon = QIcon(pixmap)
+    reg_action = QAction(icon, "Perform Registration", Window_two)
+    reg_action.setStatusTip("Register images and show overlay")
+    toolbar.addAction(reg_action)
+
+    def registration_func():
+        try:
+            if Window_one.viewer.image_item is None or Window_two.viewer.image_item is None:
+                QMessageBox.warning(Window_two, "Error", "Both windows must have images loaded.")
+                return
+
+            points1_dict = {int(n.toPlainText()): [c[0], c[1]] for n, c in zip(Window_one.viewer.number_items, Window_one.viewer.coordinates)}
+            points2_dict = {int(n.toPlainText()): [c[0], c[1]] for n, c in zip(Window_two.viewer.number_items, Window_two.viewer.coordinates)}
+            common_keys = sorted(set(points1_dict) & set(points2_dict))
+            if len(common_keys) < 5:
+                QMessageBox.warning(Window_two, "Error", "At least 5 common points required.")
+                return
+
+            points1 = np.array([points1_dict[k] for k in common_keys])
+            points2 = np.array([points2_dict[k] for k in common_keys])
+
+            def pixmap_to_cv(pixmap):
+                image = pixmap.toImage()
+                width = image.width()
+                height = image.height()
+                bits = image.constBits()
+                bits.setsize(height * width * 4)
+                arr = np.frombuffer(bits, np.uint8).reshape((height, width, 4))
+                return arr[:, :, [0, 1, 2]]  # BGRA to BGR
+
+            img1 = pixmap_to_cv(Window_one.viewer.image_item.pixmap())
+            img2 = pixmap_to_cv(Window_two.viewer.image_item.pixmap())
+
+            transformed_img, _, registered_points2, inliers, _ = register_images(img1, img2, points1, points2, common_keys)
+
+            overlay_img = cv2.addWeighted(img1, 0.5, transformed_img, 0.5, 0)
+            draw_point_matches(overlay_img, points1, registered_points2, inliers.ravel(), common_keys)
+
+            overlay_window = Image_Window()
+            overlay_window.setWindowTitle("Overlay Registration Result")
+            overlay_window.viewer.load_from_numpy(overlay_img)
+            overlay_window.show()
+            active_overlays.append(overlay_window)
+        except Exception as e:
+            QMessageBox.critical(Window_two, "Error", str(e))
+
+    reg_action.triggered.connect(registration_func)
+    update_registration_button()
 
     sys.exit(app.exec())
