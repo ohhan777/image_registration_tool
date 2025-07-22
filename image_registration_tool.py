@@ -36,6 +36,7 @@ class ImageViewer(QGraphicsView):
         self.cross_items = []
         self.number_items = []
         self.coordinates = []
+        self.number_count = 0
 
         self.zoom_factor = 1.0
         self.zoom_step = 0.1
@@ -78,6 +79,7 @@ class ImageViewer(QGraphicsView):
         self.cross_items.clear()
         self.number_items.clear()
         self.coordinates.clear()
+        self.number_count = 0
         self.image_item = QGraphicsPixmapItem(pixmap)
         self.scene.addItem(self.image_item)
         self.setSceneRect(QRectF(pixmap.rect()))
@@ -516,51 +518,51 @@ class Image_Window(QMainWindow):
         self.addToolBar(toolbar)
 
         # 파일 불러오기
-        open_Aciton = QAction(QIcon('./icon/open.png'), 'Open', self)
+        open_Aciton = QAction(QIcon('./icon/open_img.png'), 'Open Image', self)
         open_Aciton.setStatusTip('Load Files')
         open_Aciton.triggered.connect(self.open_image)
         toolbar.addAction(open_Aciton)
 
         # 좌표 데이터 불러오기
-        open_txt_Aciton = QAction(QIcon('./icon/coor_on_img.png'), 'Open', self)
+        open_txt_Aciton = QAction(QIcon('./icon/open_txt.png'), 'Open Image with Coordinates', self)
         open_txt_Aciton.setStatusTip('Load Files')
         open_txt_Aciton.triggered.connect(self.open_image_with_coordinates)
         toolbar.addAction(open_txt_Aciton)
 
         # 이미지 확대
-        plus_Action = QAction(QIcon('./icon/plus.png'), 'Zoom in', self)
+        plus_Action = QAction(QIcon('./icon/zoom_in.png'), 'Zoom In', self)
         plus_Action.setStatusTip('Zoom in Image')
         plus_Action.triggered.connect(self.zoom_in)
         toolbar.addAction(plus_Action)
 
         # 이미지 축소
-        minus_Action = QAction(QIcon('./icon/minus.png'), 'Zoom out', self)
+        minus_Action = QAction(QIcon('./icon/zoom_out.png'), 'Zoom Out', self)
         minus_Action.setStatusTip('Zoom out Image')
         minus_Action.triggered.connect(self.zoom_out)
         toolbar.addAction(minus_Action)
 
         # 이미지 저장
-        save_img_Action = QAction(QIcon('./icon/save.png'), 'Save', self)
+        save_img_Action = QAction(QIcon('./icon/save_img.png'), 'Save Image', self)
         save_img_Action.setStatusTip('Zoom out Image')
         save_img_Action.triggered.connect(self.save_coordinates_image)
         toolbar.addAction(save_img_Action)
 
         # 좌표 저장
-        save_txt_Action = QAction(QIcon('./icon/txt_coordinate.png'), 'txt_coordinate', self)
+        save_txt_Action = QAction(QIcon('./icon/save_txt.png'), 'Save Coordinates', self)
         save_txt_Action.setStatusTip('Save Coordinate to txt')
         save_txt_Action.triggered.connect(self.save_coordinate_txt)
         toolbar.addAction(save_txt_Action)
 
         # 좌표 전체 삭제
-        all_erase_Action = QAction(QIcon('./icon/all_erase.png'), 'all_Erase', self)
+        all_erase_Action = QAction(QIcon('./icon/erase.png'), 'all_Erase', self)
         all_erase_Action.setStatusTip('All Erase coordinate')
-        all_erase_Action.triggered.connect(self.viewer.remove_cross_items)
+        all_erase_Action.triggered.connect(self.confirm_clear_all_coordinates)
         toolbar.addAction(all_erase_Action)
 
         # 나가기
         exit_Action = QAction(QIcon('./icon/exit.png'), 'Exit', self)
         exit_Action.setStatusTip('Exit application')
-        exit_Action.triggered.connect(QApplication.instance().quit)
+        exit_Action.triggered.connect(self.confirm_exit_application)
         toolbar.addAction(exit_Action)
 
         self.statusBar()
@@ -630,6 +632,22 @@ class Image_Window(QMainWindow):
             coord_file, _ = QFileDialog.getOpenFileName(self, "좌표 파일 열기", "", ".txt (*.txt);;모든 파일 (*)", options=options)
             if coord_file:
                 self.viewer.load_coordinates_from_txt(coord_file)
+    
+    def confirm_clear_all_coordinates(self):
+        reply = QMessageBox.question(self, '좌표 삭제 확인', 
+                                   '모든 좌표를 삭제하시겠습니까?',
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                   QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.viewer.remove_cross_items()
+    
+    def confirm_exit_application(self):
+        reply = QMessageBox.question(self, '종료 확인', 
+                                   '프로그램을 종료하시겠습니까?',
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                   QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            QApplication.instance().quit()
     
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Z and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
