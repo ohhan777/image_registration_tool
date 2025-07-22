@@ -554,7 +554,7 @@ class Image_Window(QMainWindow):
         toolbar.addAction(save_txt_Action)
 
         # 좌표 전체 삭제
-        all_erase_Action = QAction(QIcon('./icon/erase.png'), 'all_Erase', self)
+        all_erase_Action = QAction(QIcon('./icon/erase.png'), 'All Erase', self)
         all_erase_Action.setStatusTip('All Erase coordinate')
         all_erase_Action.triggered.connect(self.confirm_clear_all_coordinates)
         toolbar.addAction(all_erase_Action)
