@@ -524,7 +524,7 @@ class Image_Window(QMainWindow):
         toolbar.addAction(open_Aciton)
 
         # 좌표 데이터 불러오기
-        open_txt_Aciton = QAction(QIcon('./icon/open_txt.png'), 'Open Image with Coordinates', self)
+        open_txt_Aciton = QAction(QIcon('./icon/open_img_txt.png'), 'Open Image with Coordinates', self)
         open_txt_Aciton.setStatusTip('Load Files')
         open_txt_Aciton.triggered.connect(self.open_image_with_coordinates)
         toolbar.addAction(open_txt_Aciton)
@@ -681,17 +681,7 @@ if __name__ == '__main__':
 
     # Add registration button to Window_two's toolbar
     toolbar = Window_two.findChild(QToolBar)
-    pixmap = QPixmap(24, 24)
-    pixmap.fill(QColor(255, 255, 255))
-    painter = QPainter(pixmap)
-    painter.setPen(QColor(0, 0, 0))
-    font = QFont()
-    font.setBold(True)
-    painter.setFont(font)
-    painter.drawText(QRectF(0, 0, 24, 24), Qt.AlignmentFlag.AlignCenter, "R")
-    painter.end()
-    icon = QIcon(pixmap)
-    reg_action = QAction(icon, "Perform Registration", Window_two)
+    reg_action = QAction(QIcon('./icon/reg_img.png'), "Perform Registration", Window_two)
     reg_action.setStatusTip("Register images and show overlay")
     toolbar.addAction(reg_action)
 
