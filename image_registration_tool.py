@@ -655,6 +655,16 @@ class Image_Window(QMainWindow):
         else:
             super().keyPressEvent(event)
 
+    def closeEvent(self, event):
+        reply = QMessageBox.question(self, '종료 확인',
+                                   '프로그램을 종료하시겠습니까?',
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                   QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            event.accept()
+        else:
+            event.ignore()
+
 if __name__ == '__main__':
     app = QApplication(sys.argv)
 
