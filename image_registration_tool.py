@@ -14,6 +14,8 @@ import cv2
 from PyQt6.QtGui import QImage
 
 class ImageViewer(QGraphicsView):
+    IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tif', '.tiff')
+
     def __init__(self):
         super().__init__()
         self.init_ui()
@@ -24,9 +26,12 @@ class ImageViewer(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # 마우스 추적 활성화
         self.setMouseTracking(True)
+
+        # 드래그 앤 드롭 활성화
+        self.setAcceptDrops(True)
 
     def init_ui(self):
         self.scene = QGraphicsScene(self)
@@ -37,6 +42,7 @@ class ImageViewer(QGraphicsView):
         self.number_items = []
         self.coordinates = []
         self.number_count = 0
+        self._dirty = False
 
         self.zoom_factor = 1.0
         self.zoom_step = 0.1
@@ -57,6 +63,7 @@ class ImageViewer(QGraphicsView):
         self.number_items.clear()
         self.coordinates.clear()
         self.number_count = 0
+        self._dirty = False
         pixmap = QPixmap(file_name)
         if not pixmap.isNull():
             self.image_item = QGraphicsPixmapItem(pixmap)
@@ -84,6 +91,7 @@ class ImageViewer(QGraphicsView):
         self.scene.addItem(self.image_item)
         self.setSceneRect(QRectF(pixmap.rect()))
         self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._dirty = False
 
     # 좌표 저장
     def save_coordinates_image(self, file_name):
@@ -179,6 +187,7 @@ class ImageViewer(QGraphicsView):
         self.number_items.append(number_item)
         self.number_count += 1
         self.coordinates.append(((pos.x()), (pos.y())))
+        self._dirty = True
         try:
             update_registration_button()
         except NameError:
@@ -192,9 +201,10 @@ class ImageViewer(QGraphicsView):
             self.scene.removeItem(n_item)
 
         self.coordinates = []
-        self.number_items = []    
+        self.number_items = []
         self.cross_items = []
         self.number_count = 0
+        self._dirty = True
         try:
             update_registration_button()
         except NameError:
@@ -223,6 +233,7 @@ class ImageViewer(QGraphicsView):
                 self.save_state_for_undo()
                 self.remove_cross_one_item(i)
                 self.coordinates.pop(i)
+                self._dirty = True
                 try:
                     update_registration_button()
                 except NameError:
@@ -301,10 +312,35 @@ class ImageViewer(QGraphicsView):
             number_item.setFont(font)
             self.number_items.append(number_item)
             self.scene.addItem(number_item)
+        self._dirty = True
         try:
             update_registration_button()
         except NameError:
             pass
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.toLocalFile().lower().endswith(self.IMAGE_EXTENSIONS):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                file_path = url.toLocalFile()
+                if file_path.lower().endswith(self.IMAGE_EXTENSIONS):
+                    window = self.window()
+                    if isinstance(window, Image_Window):
+                        window.open_image_auto(file_path)
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Z and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
@@ -366,6 +402,7 @@ class ImageViewer(QGraphicsView):
                 label = number_item.toPlainText()
                 if (x, y) != (None, None):
                     file.write(f"{label} {x}, {y}\n")
+        self._dirty = False
         try:
             update_registration_button()
         except NameError:
@@ -379,6 +416,7 @@ class ImageViewer(QGraphicsView):
                 if len(data) == 3:
                     index, x, y = int(data[0]), float(data[1].replace(',','')), float(data[2].replace(',',''))
                     self.add_coordinate_img(index, x, y)
+        self._dirty = False
         try:
             update_registration_button()
         except NameError:
@@ -422,6 +460,7 @@ class ImageViewer(QGraphicsView):
                 new_label = int(new_label)
                 self.number_count = max(self.number_count, new_label)  # number_count가 적어도 new_label만큼 커지도록 합니다.
                 self.number_items[index].setPlainText(str(new_label))
+                self._dirty = True
                 try:
                     update_registration_button()
                 except NameError:
@@ -617,6 +656,38 @@ class Image_Window(QMainWindow):
 
     def zoom_out(self):
         self.viewer.minus_image()
+
+    def open_image_auto(self, file_name):
+        """이미지를 열고, 같은 이름의 .txt 좌표 파일이 있으면 자동으로 함께 로드"""
+        # 미저장 좌표가 있으면 저장 여부 확인
+        if self.viewer._dirty:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle('저장 확인')
+            msg.setText('현재 좌표가 저장되지 않았습니다. 저장하시겠습니까?')
+            msg.setStandardButtons(
+                QMessageBox.StandardButton.Save |
+                QMessageBox.StandardButton.Discard |
+                QMessageBox.StandardButton.Cancel
+            )
+            msg.setDefaultButton(QMessageBox.StandardButton.Save)
+            reply = msg.exec()
+
+            if reply == QMessageBox.StandardButton.Save:
+                self.save_coordinate_txt()
+            elif reply == QMessageBox.StandardButton.Cancel:
+                return
+
+        basename = os.path.basename(file_name)
+        folder_name, _ = os.path.splitext(basename)
+        self.folder_name = folder_name
+        self.setWindowTitle(self.folder_name)
+        self.viewer.undo_stack.clear()
+        self.viewer.load_image(file_name)
+
+        txt_file = os.path.splitext(file_name)[0] + '.txt'
+        if os.path.exists(txt_file):
+            self.viewer.load_coordinates_from_txt(txt_file)
 
     def open_image_with_coordinates(self):
         options = QFileDialog.Option.DontUseNativeDialog
