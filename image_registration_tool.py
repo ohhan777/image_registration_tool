@@ -539,6 +539,7 @@ class Image_Window(QMainWindow):
         self.viewer = ImageViewer()
         self.setCentralWidget(self.viewer)
         self.folder_name = None
+        self.current_image_path = None
         self.initUI()
 
     def initUI(self):
@@ -612,6 +613,7 @@ class Image_Window(QMainWindow):
             file_name, _ = QFileDialog.getOpenFileName(self, "Open Image File", "", "Images (*.png *.jpg *.bmp *.gif *.tif);;All Files (*)", options=options)
         
         if file_name:
+            self.current_image_path = file_name
             basename = os.path.basename(file_name)
             folder_name, _ = os.path.splitext(basename)
             self.folder_name = folder_name
@@ -678,6 +680,7 @@ class Image_Window(QMainWindow):
             elif reply == QMessageBox.StandardButton.Cancel:
                 return
 
+        self.current_image_path = file_name
         basename = os.path.basename(file_name)
         folder_name, _ = os.path.splitext(basename)
         self.folder_name = folder_name
@@ -693,6 +696,7 @@ class Image_Window(QMainWindow):
         options = QFileDialog.Option.DontUseNativeDialog
         file_name, _ = QFileDialog.getOpenFileName(self, "이미지 파일 열기", "", "이미지 (*.png *.jpg *.bmp *.gif *.tif);;모든 파일 (*)", options=options)
         if file_name:
+            self.current_image_path = file_name
             basename = os.path.basename(file_name)
             folder_name, _ = os.path.splitext(basename)
             self.folder_name = folder_name
@@ -720,8 +724,18 @@ class Image_Window(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             QApplication.instance().quit()
     
+    def quick_save_coordinates(self):
+        """Ctrl+S: 이미지와 같은 디렉토리에 동일 이름의 .txt로 좌표 즉시 저장"""
+        if not self.current_image_path or not self.viewer.coordinates:
+            return
+        txt_path = os.path.splitext(self.current_image_path)[0] + '.txt'
+        self.viewer.save_coordinates_to_txt(txt_path)
+        self.statusBar().showMessage(f'저장 완료: {txt_path}', 3000)
+
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Z and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+        if event.key() == Qt.Key.Key_S and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.quick_save_coordinates()
+        elif event.key() == Qt.Key.Key_Z and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             self.viewer.undo()
         else:
             super().keyPressEvent(event)
