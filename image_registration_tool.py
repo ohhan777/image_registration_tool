@@ -57,13 +57,19 @@ class ImageViewer(QGraphicsView):
         # Undo 관련 변수
         self.undo_stack = []
 
+    def _mark_dirty(self, dirty=True):
+        self._dirty = dirty
+        window = self.window()
+        if isinstance(window, Image_Window):
+            window.update_title()
+
     def load_image(self, file_name):
         self.scene.clear()
         self.cross_items.clear()
         self.number_items.clear()
         self.coordinates.clear()
         self.number_count = 0
-        self._dirty = False
+        self._mark_dirty(False)
         pixmap = QPixmap(file_name)
         if not pixmap.isNull():
             self.image_item = QGraphicsPixmapItem(pixmap)
@@ -91,7 +97,7 @@ class ImageViewer(QGraphicsView):
         self.scene.addItem(self.image_item)
         self.setSceneRect(QRectF(pixmap.rect()))
         self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-        self._dirty = False
+        self._mark_dirty(False)
 
     # 좌표 저장
     def save_coordinates_image(self, file_name):
@@ -187,7 +193,7 @@ class ImageViewer(QGraphicsView):
         self.number_items.append(number_item)
         self.number_count += 1
         self.coordinates.append(((pos.x()), (pos.y())))
-        self._dirty = True
+        self._mark_dirty(True)
         try:
             update_registration_button()
         except NameError:
@@ -204,7 +210,7 @@ class ImageViewer(QGraphicsView):
         self.number_items = []
         self.cross_items = []
         self.number_count = 0
-        self._dirty = True
+        self._mark_dirty(True)
         try:
             update_registration_button()
         except NameError:
@@ -233,7 +239,7 @@ class ImageViewer(QGraphicsView):
                 self.save_state_for_undo()
                 self.remove_cross_one_item(i)
                 self.coordinates.pop(i)
-                self._dirty = True
+                self._mark_dirty(True)
                 try:
                     update_registration_button()
                 except NameError:
@@ -312,7 +318,7 @@ class ImageViewer(QGraphicsView):
             number_item.setFont(font)
             self.number_items.append(number_item)
             self.scene.addItem(number_item)
-        self._dirty = True
+        self._mark_dirty(True)
         try:
             update_registration_button()
         except NameError:
@@ -402,7 +408,7 @@ class ImageViewer(QGraphicsView):
                 label = number_item.toPlainText()
                 if (x, y) != (None, None):
                     file.write(f"{label} {x}, {y}\n")
-        self._dirty = False
+        self._mark_dirty(False)
         try:
             update_registration_button()
         except NameError:
@@ -416,7 +422,7 @@ class ImageViewer(QGraphicsView):
                 if len(data) == 3:
                     index, x, y = int(data[0]), float(data[1].replace(',','')), float(data[2].replace(',',''))
                     self.add_coordinate_img(index, x, y)
-        self._dirty = False
+        self._mark_dirty(False)
         try:
             update_registration_button()
         except NameError:
@@ -460,7 +466,7 @@ class ImageViewer(QGraphicsView):
                 new_label = int(new_label)
                 self.number_count = max(self.number_count, new_label)  # number_count가 적어도 new_label만큼 커지도록 합니다.
                 self.number_items[index].setPlainText(str(new_label))
-                self._dirty = True
+                self._mark_dirty(True)
                 try:
                     update_registration_button()
                 except NameError:
@@ -533,6 +539,31 @@ def draw_point_matches(overlay_img, points1, points2, inliers, keys=None):
             cv2.LINE_AA
         )
 
+def find_counterpart_image(file_path):
+    """NEONSAT/Google 이미지의 대응 이미지 경로를 반환. 못 찾으면 None."""
+    normalized = file_path.replace('\\', '/')
+
+    if '/L1G_tiles/tiles/png/' in normalized:
+        # NEONSAT → Google
+        counterpart = normalized.replace('/L1G_tiles/tiles/png/', '/L1G_tiles/google_ref/')
+        base, ext = os.path.splitext(counterpart)
+        counterpart = base + '_google' + ext
+    elif '/L1G_tiles/google_ref/' in normalized:
+        # Google → NEONSAT
+        counterpart = normalized.replace('/L1G_tiles/google_ref/', '/L1G_tiles/tiles/png/')
+        base, ext = os.path.splitext(counterpart)
+        if base.endswith('_google'):
+            counterpart = base[:-7] + ext
+    else:
+        return None
+
+    # 원래 OS의 경로 구분자로 복원
+    if '\\' in file_path:
+        counterpart = counterpart.replace('/', '\\')
+
+    return counterpart if os.path.exists(counterpart) else None
+
+
 class Image_Window(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -540,6 +571,8 @@ class Image_Window(QMainWindow):
         self.setCentralWidget(self.viewer)
         self.folder_name = None
         self.current_image_path = None
+        self.partner_window = None
+        self._auto_loading = False
         self.initUI()
 
     def initUI(self):
@@ -552,6 +585,13 @@ class Image_Window(QMainWindow):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         
         self.create_toolbar()
+
+    def update_title(self):
+        if self.folder_name:
+            title = self.folder_name
+            if self.viewer._dirty:
+                title += " *"
+            self.setWindowTitle(title)
 
     def create_toolbar(self):
         toolbar = QToolBar("toolbar")
@@ -611,13 +651,31 @@ class Image_Window(QMainWindow):
         if not file_name:
             options = QFileDialog.Option.DontUseNativeDialog
             file_name, _ = QFileDialog.getOpenFileName(self, "Open Image File", "", "Images (*.png *.jpg *.bmp *.gif *.tif);;All Files (*)", options=options)
-        
+
         if file_name:
+            if self.viewer._dirty:
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Icon.Warning)
+                msg.setWindowTitle('저장 확인')
+                msg.setText('현재 좌표가 저장되지 않았습니다. 저장하시겠습니까?')
+                msg.setStandardButtons(
+                    QMessageBox.StandardButton.Save |
+                    QMessageBox.StandardButton.Discard |
+                    QMessageBox.StandardButton.Cancel
+                )
+                msg.setDefaultButton(QMessageBox.StandardButton.Save)
+                reply = msg.exec()
+                if reply == QMessageBox.StandardButton.Save:
+                    self.save_coordinate_txt()
+                elif reply == QMessageBox.StandardButton.Cancel:
+                    return
+
             self.current_image_path = file_name
             basename = os.path.basename(file_name)
             folder_name, _ = os.path.splitext(basename)
             self.folder_name = folder_name
-            self.setWindowTitle(self.folder_name)
+            self.update_title()
+            self.viewer.undo_stack.clear()
             self.viewer.load_image(file_name)
 
     def save_coordinates_image(self):
@@ -684,13 +742,23 @@ class Image_Window(QMainWindow):
         basename = os.path.basename(file_name)
         folder_name, _ = os.path.splitext(basename)
         self.folder_name = folder_name
-        self.setWindowTitle(self.folder_name)
+        self.update_title()
         self.viewer.undo_stack.clear()
         self.viewer.load_image(file_name)
 
         txt_file = os.path.splitext(file_name)[0] + '.txt'
         if os.path.exists(txt_file):
             self.viewer.load_coordinates_from_txt(txt_file)
+
+        # NEONSAT/Google 대응 이미지 자동 로딩
+        if not self._auto_loading and self.partner_window:
+            counterpart = find_counterpart_image(file_name)
+            if counterpart:
+                self._auto_loading = True
+                try:
+                    self.partner_window.open_image_auto(counterpart)
+                finally:
+                    self._auto_loading = False
 
     def open_image_with_coordinates(self):
         options = QFileDialog.Option.DontUseNativeDialog
@@ -702,7 +770,7 @@ class Image_Window(QMainWindow):
             self.folder_name = folder_name
 
             self.viewer.load_image(file_name)
-            self.setWindowTitle(self.folder_name)
+            self.update_title()
             # 기존 좌표 데이터 로드
             coord_file, _ = QFileDialog.getOpenFileName(self, "좌표 파일 열기", "", ".txt (*.txt);;모든 파일 (*)", options=options)
             if coord_file:
@@ -717,12 +785,30 @@ class Image_Window(QMainWindow):
             self.viewer.remove_cross_items()
     
     def confirm_exit_application(self):
-        reply = QMessageBox.question(self, '종료 확인', 
-                                   '프로그램을 종료하시겠습니까?',
-                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                   QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            QApplication.instance().quit()
+        if self.viewer._dirty:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle('종료 확인')
+            msg.setText('저장되지 않은 좌표가 있습니다. 저장하시겠습니까?')
+            msg.setStandardButtons(
+                QMessageBox.StandardButton.Save |
+                QMessageBox.StandardButton.Discard |
+                QMessageBox.StandardButton.Cancel
+            )
+            msg.setDefaultButton(QMessageBox.StandardButton.Save)
+            reply = msg.exec()
+            if reply == QMessageBox.StandardButton.Save:
+                self.quick_save_coordinates()
+                QApplication.instance().quit()
+            elif reply == QMessageBox.StandardButton.Discard:
+                QApplication.instance().quit()
+        else:
+            reply = QMessageBox.question(self, '종료 확인',
+                                       '프로그램을 종료하시겠습니까?',
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                       QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                QApplication.instance().quit()
     
     def quick_save_coordinates(self):
         """Ctrl+S: 이미지와 같은 디렉토리에 동일 이름의 .txt로 좌표 즉시 저장"""
@@ -741,14 +827,34 @@ class Image_Window(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
-        reply = QMessageBox.question(self, '종료 확인',
-                                   '프로그램을 종료하시겠습니까?',
-                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                   QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            event.accept()
+        if self.viewer._dirty:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle('종료 확인')
+            msg.setText('저장되지 않은 좌표가 있습니다. 저장하시겠습니까?')
+            msg.setStandardButtons(
+                QMessageBox.StandardButton.Save |
+                QMessageBox.StandardButton.Discard |
+                QMessageBox.StandardButton.Cancel
+            )
+            msg.setDefaultButton(QMessageBox.StandardButton.Save)
+            reply = msg.exec()
+            if reply == QMessageBox.StandardButton.Save:
+                self.quick_save_coordinates()
+                event.accept()
+            elif reply == QMessageBox.StandardButton.Discard:
+                event.accept()
+            else:
+                event.ignore()
         else:
-            event.ignore()
+            reply = QMessageBox.question(self, '종료 확인',
+                                       '프로그램을 종료하시겠습니까?',
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                       QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                event.accept()
+            else:
+                event.ignore()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
@@ -759,6 +865,9 @@ if __name__ == '__main__':
     Window_two = Image_Window()
     Window_two.setWindowTitle("Image Registration Tool 2")
     Window_two.move(350, 0)
+
+    Window_one.partner_window = Window_two
+    Window_two.partner_window = Window_one
     Window_two.show()
 
     active_overlays = []
