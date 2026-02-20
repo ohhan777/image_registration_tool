@@ -544,16 +544,16 @@ def find_counterpart_image(file_path):
     normalized = file_path.replace('\\', '/')
 
     if '/L1G_tiles/tiles/png/' in normalized:
-        # NEONSAT → Google
+        # NEONSAT (.png) → Google (_google.tif)
         counterpart = normalized.replace('/L1G_tiles/tiles/png/', '/L1G_tiles/google_ref/')
-        base, ext = os.path.splitext(counterpart)
-        counterpart = base + '_google' + ext
+        base, _ = os.path.splitext(counterpart)
+        counterpart = base + '_google.tif'
     elif '/L1G_tiles/google_ref/' in normalized:
-        # Google → NEONSAT
+        # Google (_google.tif) → NEONSAT (.png)
         counterpart = normalized.replace('/L1G_tiles/google_ref/', '/L1G_tiles/tiles/png/')
-        base, ext = os.path.splitext(counterpart)
+        base, _ = os.path.splitext(counterpart)
         if base.endswith('_google'):
-            counterpart = base[:-7] + ext
+            counterpart = base[:-7] + '.png'
     else:
         return None
 
