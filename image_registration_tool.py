@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsTextItem,
     QToolBar, QFileDialog, QInputDialog, QLineEdit, QMessageBox
 )
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QIcon, QAction, QKeySequence
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QIcon, QAction, QKeySequence, QPainterPath
 from PIL import Image, ImageDraw, ImageFont
 import os
 
@@ -131,11 +131,13 @@ class ImageViewer(QGraphicsView):
     def plus_image(self):
         self.zoom_factor += self.zoom_step
         self.scale(self.zoom_factor, self.zoom_factor)
+        self._notify_sync()
 
     def minus_image(self):
         if self.zoom_factor > self.zoom_step:
             self.zoom_factor -= self.zoom_step
             self.scale(self.zoom_factor, self.zoom_factor)
+            self._notify_sync()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -359,11 +361,12 @@ class ImageViewer(QGraphicsView):
             # 드래그 거리 계산
             delta = event.position().toPoint() - self.last_pan_point
             self.last_pan_point = event.position().toPoint()
-            
+
             # 스크롤바 이동
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
-        
+            self._notify_sync()
+
         super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event):
@@ -374,8 +377,14 @@ class ImageViewer(QGraphicsView):
             # Ctrl+왼쪽 클릭 드래그 종료
             self.is_panning = False
             self.last_pan_point = None
-        
+
         super().mouseReleaseEvent(event)
+
+    def _notify_sync(self):
+        """뷰 변경 후 파트너 윈도우에 동기화 알림"""
+        window = self.window()
+        if isinstance(window, Image_Window) and not window._syncing:
+            window._sync_to_partner()
 
     def wheelEvent(self, event):
         # 마우스 휠 이벤트를 감지하여 이미지 확대/축소
@@ -397,6 +406,7 @@ class ImageViewer(QGraphicsView):
 
         # 이미지를 확대/축소합니다.
         self.scale(self.zoom_level, self.zoom_level)
+        self._notify_sync()
 
     # txt 파일로 좌표 데이터 저장
     def save_coordinates_to_txt(self, file_name):
@@ -543,14 +553,14 @@ def find_counterpart_image(file_path):
     """NEONSAT/Google 이미지의 대응 이미지 경로를 반환. 못 찾으면 None."""
     normalized = file_path.replace('\\', '/')
 
-    if '/L1G_tiles/tiles/png/' in normalized:
+    if '/tiles/png/' in normalized:
         # NEONSAT (.png) → Google (_google.tif)
-        counterpart = normalized.replace('/L1G_tiles/tiles/png/', '/L1G_tiles/google_ref/')
+        counterpart = normalized.replace('/tiles/png/', '/google_ref/')
         base, _ = os.path.splitext(counterpart)
         counterpart = base + '_google.tif'
-    elif '/L1G_tiles/google_ref/' in normalized:
+    elif '/google_ref/' in normalized:
         # Google (_google.tif) → NEONSAT (.png)
-        counterpart = normalized.replace('/L1G_tiles/google_ref/', '/L1G_tiles/tiles/png/')
+        counterpart = normalized.replace('/google_ref/', '/tiles/png/')
         base, _ = os.path.splitext(counterpart)
         if base.endswith('_google'):
             counterpart = base[:-7] + '.png'
@@ -564,6 +574,49 @@ def find_counterpart_image(file_path):
     return counterpart if os.path.exists(counterpart) else None
 
 
+def _create_lock_icon(locked):
+    """자물쇠 아이콘 생성 (locked=True: 잠긴 자물쇠, locked=False: 열린 자물쇠)"""
+    size = 32
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    # Shackle (U자형 고리)
+    shackle_pen = QPen(QColor(80, 80, 80), 3)
+    painter.setPen(shackle_pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    path = QPainterPath()
+    if locked:
+        path.moveTo(10, 17)
+        path.lineTo(10, 11)
+        path.cubicTo(10, 4, 22, 4, 22, 11)
+        path.lineTo(22, 17)
+    else:
+        path.moveTo(10, 17)
+        path.lineTo(10, 11)
+        path.cubicTo(10, 4, 22, 4, 22, 11)
+        path.lineTo(22, 7)
+    painter.drawPath(path)
+
+    # Lock body (사각형 몸체)
+    painter.setPen(QPen(QColor(80, 80, 80), 1.5))
+    if locked:
+        painter.setBrush(QColor(255, 193, 7))   # Gold
+    else:
+        painter.setBrush(QColor(180, 180, 180))  # Gray
+    painter.drawRoundedRect(6, 16, 20, 13, 2, 2)
+
+    # Keyhole (열쇠 구멍)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(80, 80, 80))
+    painter.drawEllipse(QPointF(16, 21), 2, 2)
+    painter.drawRect(15, 22, 2, 3)
+
+    painter.end()
+    return QIcon(pixmap)
+
+
 class Image_Window(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -573,6 +626,8 @@ class Image_Window(QMainWindow):
         self.current_image_path = None
         self.partner_window = None
         self._auto_loading = False
+        self._sync_enabled = False
+        self._syncing = False
         self.initUI()
 
     def initUI(self):
@@ -620,6 +675,15 @@ class Image_Window(QMainWindow):
         minus_Action.setStatusTip('Zoom out Image')
         minus_Action.triggered.connect(self.zoom_out)
         toolbar.addAction(minus_Action)
+
+        # Sync 토글
+        self.sync_action = QAction(_create_lock_icon(False), 'Sync Views', self)
+        self.sync_action.setStatusTip('Sync zoom and pan between windows')
+        self.sync_action.setCheckable(True)
+        self.sync_action.triggered.connect(self._toggle_sync)
+        toolbar.addAction(self.sync_action)
+
+        toolbar.addSeparator()
 
         # 이미지 저장
         save_img_Action = QAction(QIcon('./icon/save_img.png'), 'Save Image', self)
@@ -759,6 +823,35 @@ class Image_Window(QMainWindow):
                     self.partner_window.open_image_auto(counterpart)
                 finally:
                     self._auto_loading = False
+
+    def _toggle_sync(self, checked):
+        """Sync 토글: 양쪽 윈도우의 줌/패닝 연동"""
+        self._sync_enabled = checked
+        self.sync_action.setIcon(_create_lock_icon(checked))
+
+        if self.partner_window:
+            self.partner_window._sync_enabled = checked
+            self.partner_window.sync_action.blockSignals(True)
+            self.partner_window.sync_action.setChecked(checked)
+            self.partner_window.sync_action.setIcon(_create_lock_icon(checked))
+            self.partner_window.sync_action.blockSignals(False)
+
+        if checked:
+            self._sync_to_partner()
+
+    def _sync_to_partner(self):
+        """현재 뷰의 줌/스크롤 상태를 파트너 윈도우에 동기화"""
+        if not self._sync_enabled or self._syncing or not self.partner_window:
+            return
+
+        self._syncing = True
+        try:
+            partner = self.partner_window
+            partner.viewer.setTransform(self.viewer.transform())
+            center = self.viewer.mapToScene(self.viewer.viewport().rect().center())
+            partner.viewer.centerOn(center)
+        finally:
+            self._syncing = False
 
     def open_image_with_coordinates(self):
         options = QFileDialog.Option.DontUseNativeDialog
