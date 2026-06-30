@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QIcon, QAction, QKeySequence, QPainterPath
 from PIL import Image, ImageDraw, ImageFont
 import os
+import re
 
 import cv2
 from PyQt6.QtGui import QImage
@@ -550,28 +551,47 @@ def draw_point_matches(overlay_img, points1, points2, inliers, keys=None):
         )
 
 def find_counterpart_image(file_path):
-    """NEONSAT/Google 이미지의 대응 이미지 경로를 반환. 못 찾으면 None."""
-    normalized = file_path.replace('\\', '/')
+    """neonsat_L1G ↔ google_ref 대응 이미지 경로를 반환. 못 찾으면 None.
 
-    if '/tiles/png/' in normalized:
-        # NEONSAT (.png) → Google (_google.tif)
-        counterpart = normalized.replace('/tiles/png/', '/google_ref/')
-        base, _ = os.path.splitext(counterpart)
-        counterpart = base + '_google.tif'
-    elif '/google_ref/' in normalized:
-        # Google (_google.tif) → NEONSAT (.png)
-        counterpart = normalized.replace('/google_ref/', '/tiles/png/')
-        base, _ = os.path.splitext(counterpart)
-        if base.endswith('_google'):
-            counterpart = base[:-7] + '.png'
+    예) .../neonsat_google_tie_points/neonsat_L1G/neonsat_L1G_R001_C003.png
+      ↔ .../neonsat_google_tie_points/google_ref/google_ref_R001_C003.tif
+
+    두 폴더는 같은 부모(neonsat_google_tie_points) 아래의 형제 폴더이며,
+    파일명의 타일 식별자(R###_C###)로 짝을 찾는다. 폴더마다 접두사와
+    확장자가 다르므로(neonsat은 .png, google은 .tif) 식별자만으로 매칭한다.
+    """
+    normalized = file_path.replace('\\', '/')
+    basename = os.path.basename(normalized)
+
+    # 타일 식별자(R###_C###) 추출
+    match = re.search(r'R\d+_C\d+', basename)
+    if not match:
+        return None
+    tile = match.group(0)
+
+    # 현재 파일이 위치한 폴더(neonsat_L1G 또는 google_ref)와 대응 폴더 결정
+    src_dir = os.path.dirname(normalized)
+    parent_dir = os.path.dirname(src_dir)
+    src_folder = os.path.basename(src_dir)
+
+    if src_folder == 'neonsat_L1G':
+        target_folder = 'google_ref'
+    elif src_folder == 'google_ref':
+        target_folder = 'neonsat_L1G'
     else:
         return None
 
-    # 원래 OS의 경로 구분자로 복원
-    if '\\' in file_path:
-        counterpart = counterpart.replace('/', '\\')
+    # 대응 폴더에서 같은 타일 식별자를 가진 이미지 파일 탐색
+    target_dir = f"{parent_dir}/{target_folder}"
+    for ext in ImageViewer.IMAGE_EXTENSIONS:
+        counterpart = f"{target_dir}/{target_folder}_{tile}{ext}"
+        if os.path.exists(counterpart):
+            # 원래 OS의 경로 구분자로 복원
+            if '\\' in file_path:
+                counterpart = counterpart.replace('/', '\\')
+            return counterpart
 
-    return counterpart if os.path.exists(counterpart) else None
+    return None
 
 
 def _create_lock_icon(locked):
@@ -730,7 +750,9 @@ class Image_Window(QMainWindow):
                 msg.setDefaultButton(QMessageBox.StandardButton.Save)
                 reply = msg.exec()
                 if reply == QMessageBox.StandardButton.Save:
-                    self.save_coordinate_txt()
+                    if not self.save_coordinate_txt():
+                        # 저장이 무결성 오류/취소로 막히면 새 이미지를 열지 않음
+                        return
                 elif reply == QMessageBox.StandardButton.Cancel:
                     return
 
@@ -764,6 +786,11 @@ class Image_Window(QMainWindow):
             pixmap.save(file_name)
             
     def save_coordinate_txt(self):
+        ok, message = self.check_pair_integrity()
+        if not ok:
+            self._show_integrity_warning(message)
+            return False
+
         dialog = QFileDialog(self, "Save txt with Coordinates", f"{self.folder_name}")
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
         dialog.setNameFilter(".txt (*.txt);;All Files (*)")
@@ -774,6 +801,8 @@ class Image_Window(QMainWindow):
             file_name = dialog.selectedFiles()[0]
             if file_name:
                 self.viewer.save_coordinates_to_txt(file_name)
+                return True
+        return False
 
     def zoom_in(self):
         self.viewer.plus_image()
@@ -798,7 +827,9 @@ class Image_Window(QMainWindow):
             reply = msg.exec()
 
             if reply == QMessageBox.StandardButton.Save:
-                self.save_coordinate_txt()
+                if not self.save_coordinate_txt():
+                    # 저장이 무결성 오류/취소로 막히면 새 이미지를 열지 않음
+                    return
             elif reply == QMessageBox.StandardButton.Cancel:
                 return
 
@@ -891,8 +922,9 @@ class Image_Window(QMainWindow):
             msg.setDefaultButton(QMessageBox.StandardButton.Save)
             reply = msg.exec()
             if reply == QMessageBox.StandardButton.Save:
-                self.quick_save_coordinates()
-                QApplication.instance().quit()
+                if self.quick_save_coordinates():
+                    QApplication.instance().quit()
+                # 저장이 막히면 종료하지 않고 무결성 문제 해결을 유도
             elif reply == QMessageBox.StandardButton.Discard:
                 QApplication.instance().quit()
         else:
@@ -903,13 +935,90 @@ class Image_Window(QMainWindow):
             if reply == QMessageBox.StandardButton.Yes:
                 QApplication.instance().quit()
     
+    @staticmethod
+    def _index_stats(viewer):
+        """뷰어의 좌표 레이블을 정수 인덱스로 집계.
+
+        반환: (인덱스 집합, 중복 인덱스 리스트, 정수가 아닌 레이블 리스트)
+        """
+        counts = {}
+        non_int = []
+        for item in viewer.number_items:
+            label = item.toPlainText()
+            try:
+                value = int(label)
+            except ValueError:
+                non_int.append(label)
+                continue
+            counts[value] = counts.get(value, 0) + 1
+        indices = set(counts)
+        dups = sorted(v for v, c in counts.items() if c > 1)
+        return indices, dups, non_int
+
+    def check_pair_integrity(self):
+        """두 윈도우의 정합점 무결성 검사.
+
+        - 두 윈도우의 정합점 개수가 일치하는가
+        - 한 윈도우 안에 중복되는 인덱스가 없는가
+        - 인덱스가 1:1로 매핑되는가(짝 없이 남는 인덱스가 없는가)
+
+        문제 없으면 (True, ''), 있으면 (False, 문제 설명 메시지)를 반환한다.
+        """
+        partner = self.partner_window
+        if partner is None:
+            return True, ''
+
+        name_a = self.folder_name or self.windowTitle()
+        name_b = partner.folder_name or partner.windowTitle()
+
+        idx_a, dup_a, bad_a = self._index_stats(self.viewer)
+        idx_b, dup_b, bad_b = self._index_stats(partner.viewer)
+
+        problems = []
+        if bad_a:
+            problems.append(f"[{name_a}] 정수가 아닌 레이블: {', '.join(bad_a)}")
+        if bad_b:
+            problems.append(f"[{name_b}] 정수가 아닌 레이블: {', '.join(bad_b)}")
+        if dup_a:
+            problems.append(f"[{name_a}] 중복된 인덱스: {', '.join(map(str, dup_a))}")
+        if dup_b:
+            problems.append(f"[{name_b}] 중복된 인덱스: {', '.join(map(str, dup_b))}")
+
+        only_a = sorted(idx_a - idx_b)
+        only_b = sorted(idx_b - idx_a)
+        if only_a:
+            problems.append(f"[{name_a}]에만 있어 짝이 없는 인덱스: {', '.join(map(str, only_a))}")
+        if only_b:
+            problems.append(f"[{name_b}]에만 있어 짝이 없는 인덱스: {', '.join(map(str, only_b))}")
+
+        count_a = len(self.viewer.coordinates)
+        count_b = len(partner.viewer.coordinates)
+        if count_a != count_b:
+            problems.append(f"정합점 개수 불일치: [{name_a}] {count_a}개 ↔ [{name_b}] {count_b}개")
+
+        if problems:
+            return False, '\n'.join(problems)
+        return True, ''
+
+    def _show_integrity_warning(self, message):
+        QMessageBox.warning(
+            self, '정합점 무결성 오류',
+            '정합점 쌍에 문제가 있어 저장할 수 없습니다.\n'
+            '아래 문제를 해결한 뒤 다시 저장하세요.\n\n' + message
+        )
+
     def quick_save_coordinates(self):
         """Ctrl+S: 이미지와 같은 디렉토리에 동일 이름의 .txt로 좌표 즉시 저장"""
         if not self.current_image_path or not self.viewer.coordinates:
-            return
+            return True
+        ok, message = self.check_pair_integrity()
+        if not ok:
+            self._show_integrity_warning(message)
+            return False
         txt_path = os.path.splitext(self.current_image_path)[0] + '.txt'
         self.viewer.save_coordinates_to_txt(txt_path)
         self.statusBar().showMessage(f'저장 완료: {txt_path}', 3000)
+        return True
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_S and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
@@ -933,8 +1042,11 @@ class Image_Window(QMainWindow):
             msg.setDefaultButton(QMessageBox.StandardButton.Save)
             reply = msg.exec()
             if reply == QMessageBox.StandardButton.Save:
-                self.quick_save_coordinates()
-                event.accept()
+                if self.quick_save_coordinates():
+                    event.accept()
+                else:
+                    # 저장이 막히면 종료하지 않고 무결성 문제 해결을 유도
+                    event.ignore()
             elif reply == QMessageBox.StandardButton.Discard:
                 event.accept()
             else:
@@ -986,6 +1098,12 @@ if __name__ == '__main__':
         try:
             if Window_one.viewer.image_item is None or Window_two.viewer.image_item is None:
                 QMessageBox.warning(Window_two, "Error", "Both windows must have images loaded.")
+                return
+
+            # 정합 전 정합점 무결성 검사 (개수 일치, 중복 없음, 1:1 매핑)
+            ok, message = Window_two.check_pair_integrity()
+            if not ok:
+                Window_two._show_integrity_warning(message)
                 return
 
             points1_dict = {int(n.toPlainText()): [c[0], c[1]] for n, c in zip(Window_one.viewer.number_items, Window_one.viewer.coordinates)}
