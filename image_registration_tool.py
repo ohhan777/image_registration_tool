@@ -1,3 +1,9 @@
+import os
+# GeoTIFF(google_ref .tif)의 지리 메타데이터 태그를 Qt TIFF 플러그인이
+# 인식하지 못해 찍는 "Unknown field with tag ..." 경고를 끈다.
+# (이미지 로드에는 문제가 없으며 콘솔 경고만 억제)
+os.environ.setdefault("QT_LOGGING_RULES", "qt.imageformats.tiff=false")
+
 import sys
 import typing
 import numpy as np
@@ -8,7 +14,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QIcon, QAction, QKeySequence, QPainterPath
 from PIL import Image, ImageDraw, ImageFont
-import os
 import re
 
 import cv2
@@ -54,6 +59,11 @@ class ImageViewer(QGraphicsView):
         # 드래그 스크롤 관련 변수
         self.last_pan_point = None
         self.is_panning = False
+
+        # 좌클릭 드래그/클릭 구분용 변수
+        self._left_press_pos = None
+        self._left_moved = False
+        self._click_drag_threshold = 4  # 이 픽셀 이상 움직이면 클릭이 아닌 드래그로 간주
         
         # Undo 관련 변수
         self.undo_stack = []
@@ -147,18 +157,11 @@ class ImageViewer(QGraphicsView):
                 self.last_pan_point = event.position().toPoint()
                 self.is_panning = True
                 return
-                
-            pos = self.mapToScene(event.position().toPoint())
 
-            # 사용자가 이미 존재하는 숫자 레이블을 클릭했는지 확인합니다.
-            for i, (x, y) in enumerate(self.coordinates):
-                distance = (x - pos.x())**2 + (y - pos.y())**2
-                if distance < 9:
-                    new_label, ok = QInputDialog.getText(self, '레이블 수정', '좌표에 대한 새로운 레이블을 입력하세요:', QLineEdit.EchoMode.Normal, self.number_items[i].toPlainText())
-                    if ok:
-                        self.modify_coordinate_label(i, new_label)
-                    return
-            self.Click_Coordinate(pos)
+            # 플레인 좌클릭: 드래그와 클릭을 구분하기 위해 눌린 위치만 기록하고
+            # 실제 처리(점 찍기/레이블 편집)는 마우스 릴리스 시점으로 미룬다.
+            self._left_press_pos = event.position().toPoint()
+            self._left_moved = False
         elif event.button() == Qt.MouseButton.RightButton:
             pos = self.mapToScene(event.position().toPoint())
             # 클릭한 좌표 주변에 있는 좌표를 삭제
@@ -168,6 +171,20 @@ class ImageViewer(QGraphicsView):
             # 중간 마우스 버튼으로 패닝 시작
             self.last_pan_point = event.position().toPoint()
             self.is_panning = True
+
+    def _handle_left_click(self, event):
+        """드래그가 아닌 실제 클릭일 때: 기존 레이블 편집 또는 새 점 찍기."""
+        pos = self.mapToScene(event.position().toPoint())
+
+        # 사용자가 이미 존재하는 숫자 레이블을 클릭했는지 확인합니다.
+        for i, (x, y) in enumerate(self.coordinates):
+            distance = (x - pos.x())**2 + (y - pos.y())**2
+            if distance < 9:
+                new_label, ok = QInputDialog.getText(self, '레이블 수정', '좌표에 대한 새로운 레이블을 입력하세요:', QLineEdit.EchoMode.Normal, self.number_items[i].toPlainText())
+                if ok:
+                    self.modify_coordinate_label(i, new_label)
+                return
+        self.Click_Coordinate(pos)
 
     def Click_Coordinate(self, pos):
         # Undo를 위한 현재 상태 저장
@@ -358,6 +375,15 @@ class ImageViewer(QGraphicsView):
             super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # 플레인 좌클릭 후 임계값 이상 움직이면 클릭이 아닌 드래그(패닝)로 전환
+        if (self._left_press_pos is not None and not self._left_moved
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            moved = (event.position().toPoint() - self._left_press_pos).manhattanLength()
+            if moved > self._click_drag_threshold:
+                self._left_moved = True
+                self.is_panning = True
+                self.last_pan_point = event.position().toPoint()
+
         if self.is_panning and self.last_pan_point is not None:
             # 드래그 거리 계산
             delta = event.position().toPoint() - self.last_pan_point
@@ -369,15 +395,21 @@ class ImageViewer(QGraphicsView):
             self._notify_sync()
 
         super().mouseMoveEvent(event)
-    
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
             self.is_panning = False
             self.last_pan_point = None
-        elif event.button() == Qt.MouseButton.LeftButton and self.is_panning:
-            # Ctrl+왼쪽 클릭 드래그 종료
-            self.is_panning = False
-            self.last_pan_point = None
+        elif event.button() == Qt.MouseButton.LeftButton:
+            if self.is_panning:
+                # 드래그였으므로 점을 찍지 않고 패닝만 종료
+                self.is_panning = False
+                self.last_pan_point = None
+            elif self._left_press_pos is not None and not self._left_moved:
+                # 움직임이 거의 없었던 실제 클릭 → 점 찍기/레이블 편집 수행
+                self._handle_left_click(event)
+            self._left_press_pos = None
+            self._left_moved = False
 
         super().mouseReleaseEvent(event)
 
@@ -648,13 +680,15 @@ class Image_Window(QMainWindow):
         self._auto_loading = False
         self._sync_enabled = False
         self._syncing = False
+        self.is_overlay = False
         self.initUI()
 
     def initUI(self):
         self.setWindowTitle("Image Registration Tool 1")
         self.setWindowIcon(QIcon('./icon/earth.png'))
         self.move(0, 0)
-        self.setFixedSize(1000, 1000)
+        # 고정 크기 대신 초기 크기만 지정 → 사용자가 창 크기를 조절할 수 있음
+        self.resize(1000, 1000)
         
         # 키보드 포커스 설정
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -1029,6 +1063,11 @@ class Image_Window(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        # 정합 결과(오버레이) 창은 하나의 결과 뷰일 뿐이므로,
+        # 프로그램 종료 확인 없이 그냥 닫는다.
+        if self.is_overlay:
+            event.accept()
+            return
         if self.viewer._dirty:
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Icon.Warning)
@@ -1134,6 +1173,7 @@ if __name__ == '__main__':
             draw_point_matches(overlay_img, points1, registered_points2, inliers.ravel(), common_keys)
 
             overlay_window = Image_Window()
+            overlay_window.is_overlay = True
             overlay_window.setWindowTitle("Overlay Registration Result")
             overlay_window.viewer.load_from_numpy(overlay_img)
             
