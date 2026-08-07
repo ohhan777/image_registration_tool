@@ -81,7 +81,12 @@ class ImageViewer(QGraphicsView):
         self.coordinates.clear()
         self.number_count = 0
         self._mark_dirty(False)
-        pixmap = QPixmap(file_name)
+        # tRNS 청크가 있는 PNG는 특정 색(예: 검정)이 투명으로 로드되어
+        # 씬의 흰 배경이 비쳐 보인다. 알파를 제거해 원본 색을 그대로 표시한다.
+        image = QImage(file_name)
+        if image.hasAlphaChannel():
+            image = image.convertToFormat(QImage.Format.Format_RGB32)
+        pixmap = QPixmap.fromImage(image)
         if not pixmap.isNull():
             self.image_item = QGraphicsPixmapItem(pixmap)
             self.scene.addItem(self.image_item)
