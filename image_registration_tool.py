@@ -875,24 +875,6 @@ RANSAC_PARAMS = dict(
 )
 
 
-def register_images(img1, img2, points1, points2, keys):
-    if img1 is None or img2 is None:
-        raise ValueError("Images not loaded")
-    
-    src_points = points2.astype(np.float32)
-    dst_points = points1.astype(np.float32)
-    
-    transform_matrix, inliers = cv2.findHomography(src_points, dst_points, **RANSAC_PARAMS)
-
-    if transform_matrix is None:
-        raise ValueError("Failed to estimate homography transform")
-
-    transformed_img = warp_to_reference(img2, transform_matrix, img1.shape)
-    registered_points2 = transform_points(points2, transform_matrix)
-
-    return transformed_img, transform_matrix, registered_points2, inliers, keys
-
-
 def _translation_matrix(dx, dy):
     return np.array([[1.0, 0.0, dx],
                      [0.0, 1.0, dy],
@@ -983,16 +965,90 @@ def estimate_live_transform(points1, points2, size1, size2):
     return _translation_matrix(offset[0], offset[1]), None, '평행이동'
 
 
-def warp_to_reference(moving_img, matrix, reference_shape):
-    """정합 대상 영상을 기준 영상 좌표계로 워핑한다 (바깥은 검정)."""
+def warp_to_reference(moving_img, matrix, size):
+    """정합 대상 영상을 주어진 크기의 캔버스로 워핑한다 (바깥은 검정).
+
+    size는 (너비, 높이).
+    """
     return cv2.warpPerspective(
         moving_img,
         matrix,
-        (reference_shape[1], reference_shape[0]),
+        size,
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0
     )
+
+
+# 퇴화한 변환 때문에 캔버스가 터무니없이 커지는 것을 막는 상한
+CANVAS_AREA_LIMIT = 6.0      # 두 영상 중 넓은 쪽 넓이의 몇 배까지 허용할지
+CANVAS_SIDE_LIMIT = 16384    # 한 변의 최대 픽셀 수
+
+
+def overlay_canvas(base_shape, moving_shape, matrix):
+    """기준 영상과 워핑된 영상을 모두 담는 캔버스를 계산한다.
+
+    기준 영상 크기에 맞춰 자르면 그보다 큰 영상이 잘려 나가므로, 두 영상을
+    모두 감싸는 사각형을 캔버스로 삼고 그 왼쪽 위가 (0,0)이 되도록 옮긴다.
+
+    반환: (원점 보정 행렬, (너비, 높이)). 변환이 퇴화해 캔버스를 감당할 수
+    없을 만큼 키우면 None을 돌려주고, 호출한 쪽이 기준 영상 크기로 되돌아간다.
+    """
+    height1, width1 = base_shape[:2]
+    height2, width2 = moving_shape[:2]
+
+    # perspectiveTransform은 NaN 행렬을 받으면 좌표를 0으로 돌려주므로
+    # 결과만 봐서는 이상을 알 수 없다. 행렬 자체를 먼저 확인한다.
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if not np.all(np.isfinite(matrix)):
+        return None
+
+    corners = np.array([[0.0, 0.0], [width2, 0.0], [width2, height2], [0.0, height2]],
+                       dtype=np.float32).reshape(-1, 1, 2)
+    warped = cv2.perspectiveTransform(corners, matrix).reshape(-1, 2)
+    if not np.all(np.isfinite(warped)):
+        return None
+
+    # 기준 영상의 네 모서리(0,0)-(w1,h1)도 함께 담아야 한다
+    xs = np.concatenate([warped[:, 0], [0.0, float(width1)]])
+    ys = np.concatenate([warped[:, 1], [0.0, float(height1)]])
+    left, top = float(np.floor(xs.min())), float(np.floor(ys.min()))
+    width = int(np.ceil(xs.max()) - left)
+    height = int(np.ceil(ys.max()) - top)
+
+    area_limit = CANVAS_AREA_LIMIT * max(width1 * height1, width2 * height2)
+    if (width <= 0 or height <= 0
+            or width > CANVAS_SIDE_LIMIT or height > CANVAS_SIDE_LIMIT
+            or width * height > area_limit):
+        return None
+    return _translation_matrix(-left, -top), (width, height)
+
+
+def build_overlay_layers(base_img, moving_img, matrix):
+    """두 영상을 같은 캔버스 위에 올린다.
+
+    반환: (기준 레이어, 정합된 레이어, 원점 보정 행렬).
+    보정 행렬은 기준 영상 좌표를 캔버스 좌표로 옮기는 평행이동이라,
+    정합점 위치를 표시할 때도 같이 적용해야 한다.
+    """
+    canvas = overlay_canvas(base_img.shape, moving_img.shape, matrix)
+    if canvas is None:
+        # 퇴화한 변환이면 예전처럼 기준 영상 크기로 자른다
+        offset = np.eye(3)
+        size = (base_img.shape[1], base_img.shape[0])
+    else:
+        offset, size = canvas
+
+    width, height = size
+    base_layer = np.zeros((height, width, 3), dtype=np.uint8)
+    x0, y0 = int(round(offset[0, 2])), int(round(offset[1, 2]))
+    # 기준 영상은 평행이동만 하므로 워핑 대신 슬라이싱으로 붙인다(정확하고 빠르다).
+    # 캔버스는 기준 영상을 포함하도록 잡혔지만, 퇴화 대비로 잘라 넣는다.
+    patch = base_img[:height - y0, :width - x0]
+    base_layer[y0:y0 + patch.shape[0], x0:x0 + patch.shape[1]] = patch
+
+    warped_layer = warp_to_reference(moving_img, offset @ np.asarray(matrix, dtype=np.float64), size)
+    return base_layer, warped_layer, offset
 
 
 def transform_points(points, matrix):
@@ -1793,6 +1849,10 @@ class RegistrationOverlayWindow(Image_Window):
         self._markers = None        # (points1, registered_points2, inliers, keys)
         self._marker_items = []     # 씬에 얹은 정합점 마커
         self._flicker_mode = None   # None(합성) / 'base' / 'warped'
+        # 캔버스 원점(기준 영상이 캔버스 안에서 밀려난 양). 정합점이 늘면서
+        # 캔버스 크기가 바뀌어도 보고 있던 자리를 유지하는 데 쓴다.
+        self._origin = (0.0, 0.0)
+        self._shown_origin = None
 
         self._flicker_timer = QTimer(self)
         self._flicker_timer.timeout.connect(self._advance_flicker)
@@ -1884,14 +1944,18 @@ class RegistrationOverlayWindow(Image_Window):
 
     # ----- 레이어 합성 -----
 
-    def set_layers(self, base_img, warped_img, markers=None, status=''):
+    def set_layers(self, base_img, warped_img, markers=None, status='', origin=(0.0, 0.0)):
         """기준/정합 레이어를 교체하고 화면을 다시 그린다.
 
+        origin은 기준 영상이 캔버스 안에서 밀려난 양이다. 정합점이 늘면서
+        캔버스가 커지면 같은 지형이 다른 씬 좌표로 옮겨가는데, 이 값으로
+        보정해 사용자가 보고 있던 자리를 그대로 지킨다.
         base_img가 None이면 아직 보여줄 것이 없다는 뜻이라 상태만 알린다.
         """
         self._base_img = base_img
         self._warped_img = warped_img
         self._markers = markers
+        self._origin = (float(origin[0]), float(origin[1]))
         if status:
             self.statusBar().showMessage(status)
         if base_img is None or warped_img is None:
@@ -1920,9 +1984,26 @@ class RegistrationOverlayWindow(Image_Window):
         composed = self._compose()
         if composed is None:
             return
+
+        viewer = self.viewer
+        had_image = viewer.image_item is not None
+        transform = viewer.transform()
+        center = viewer.mapToScene(viewer.viewport().rect().center())
+        shift_x = self._origin[0] - self._shown_origin[0] if self._shown_origin else 0.0
+        shift_y = self._origin[1] - self._shown_origin[1] if self._shown_origin else 0.0
+
         # 씬이 새로 만들어졌으면 얹어 두었던 마커도 함께 사라진 상태다
-        if self.viewer.update_from_numpy(composed):
+        rebuilt = viewer.update_from_numpy(composed)
+        if rebuilt:
             self._marker_items = []
+
+        # 캔버스 크기가 바뀌면 fitInView로 화면이 초기화되므로, 첫 표시가
+        # 아니라면 보고 있던 배율과 위치를 되돌려 놓는다.
+        if had_image and (rebuilt or shift_x or shift_y):
+            viewer.setTransform(transform)
+            viewer.centerOn(center.x() + shift_x, center.y() + shift_y)
+
+        self._shown_origin = self._origin
         self._rebuild_markers()
 
     def _rebuild_markers(self):
@@ -2101,17 +2182,22 @@ if __name__ == '__main__':
             points1, points2,
             (base_img.shape[1], base_img.shape[0]),
             (moving_img.shape[1], moving_img.shape[0]))
-        warped_img = warp_to_reference(moving_img, matrix, base_img.shape)
+        base_layer, warped_layer, offset = build_overlay_layers(base_img, moving_img, matrix)
 
         markers = None
         registered_points2 = None
+        canvas_points1 = None
         inlier_mask = None if inliers is None else inliers.ravel()
         if len(keys):
-            registered_points2 = transform_points(points2, matrix)
-            markers = (points1, registered_points2, inlier_mask, keys)
+            # 정합점도 캔버스 좌표로 옮겨서 찍는다
+            canvas_points1 = points1 + [offset[0, 2], offset[1, 2]]
+            registered_points2 = transform_points(points2, offset @ matrix)
+            markers = (canvas_points1, registered_points2, inlier_mask, keys)
 
-        status = registration_status(keys, points1, registered_points2, inlier_mask, model_name)
-        window.set_layers(base_img, warped_img, markers, status)
+        status = registration_status(keys, canvas_points1, registered_points2,
+                                     inlier_mask, model_name)
+        window.set_layers(base_layer, warped_layer, markers, status,
+                          origin=(offset[0, 2], offset[1, 2]))
 
     def update_registration_button():
         reg_action.setEnabled(get_common_count() >= 5)
@@ -2181,9 +2267,15 @@ if __name__ == '__main__':
             img1 = pixmap_to_bgr(Window_one.viewer.source_pixmap())
             img2 = pixmap_to_bgr(Window_two.viewer.source_pixmap())
 
-            transformed_img, _, registered_points2, inliers, _ = register_images(img1, img2, points1, points2, common_keys)
+            # Live 미리보기와 같은 경로를 쓴다(5쌍 이상이므로 RANSAC 호모그래피)
+            matrix, inliers, model_name = estimate_live_transform(
+                points1, points2,
+                (img1.shape[1], img1.shape[0]), (img2.shape[1], img2.shape[0]))
+            base_layer, warped_layer, offset = build_overlay_layers(img1, img2, matrix)
 
-            inlier_mask = inliers.ravel()
+            inlier_mask = None if inliers is None else inliers.ravel()
+            canvas_points1 = points1 + [offset[0, 2], offset[1, 2]]
+            registered_points2 = transform_points(points2, offset @ matrix)
 
             overlay_window = RegistrationOverlayWindow()
             overlay_window.default_save_name = (
@@ -2191,10 +2283,11 @@ if __name__ == '__main__':
             overlay_window.on_closed = lambda window: (
                 active_overlays.remove(window) if window in active_overlays else None)
             overlay_window.set_layers(
-                img1, transformed_img,
-                (points1, registered_points2, inlier_mask, common_keys),
-                status=registration_status(common_keys, points1, registered_points2,
-                                           inlier_mask, '호모그래피(RANSAC)'))
+                base_layer, warped_layer,
+                (canvas_points1, registered_points2, inlier_mask, common_keys),
+                status=registration_status(common_keys, canvas_points1, registered_points2,
+                                           inlier_mask, model_name),
+                origin=(offset[0, 2], offset[1, 2]))
             overlay_window.show()
             active_overlays.append(overlay_window)
         except Exception as e:
