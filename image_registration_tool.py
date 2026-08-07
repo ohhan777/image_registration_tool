@@ -587,17 +587,37 @@ def draw_point_matches(overlay_img, points1, points2, inliers, keys=None):
             cv2.LINE_AA
         )
 
-def find_counterpart_image(file_path):
-    """neonsat_L1G ↔ google_ref 대응 이미지 경로를 반환. 못 찾으면 None.
+def _resolve_sibling_dir(parent_dir, folder_name):
+    """parent_dir 아래에서 folder_name에 해당하는 폴더의 실제 경로를 반환.
+
+    리눅스는 폴더명 대소문자를 구분하므로 'EO'/'eo' 같은 표기 차이를 흡수한다.
+    """
+    exact = f"{parent_dir}/{folder_name}"
+    if os.path.isdir(exact):
+        return exact
+    try:
+        entries = os.listdir(parent_dir)
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.lower() == folder_name.lower():
+            candidate = f"{parent_dir}/{entry}"
+            if os.path.isdir(candidate):
+                return candidate
+    return None
+
+
+def _find_tile_counterpart(normalized):
+    """neonsat_L1G ↔ google_ref: 타일 식별자(R###_C###)로 짝을 찾는다.
 
     예) .../neonsat_google_tie_points/neonsat_L1G/neonsat_L1G_R001_C003.png
       ↔ .../neonsat_google_tie_points/google_ref/google_ref_R001_C003.tif
 
     두 폴더는 같은 부모(neonsat_google_tie_points) 아래의 형제 폴더이며,
-    파일명의 타일 식별자(R###_C###)로 짝을 찾는다. 폴더마다 접두사와
-    확장자가 다르므로(neonsat은 .png, google은 .tif) 식별자만으로 매칭한다.
+    폴더마다 접두사와 확장자가 다르므로(neonsat은 .png, google은 .tif)
+    식별자만으로 매칭한다. 파일명이 '{폴더명}_{타일ID}' 규칙을 따르므로
+    대응 파일명을 그대로 조립할 수 있다.
     """
-    normalized = file_path.replace('\\', '/')
     basename = os.path.basename(normalized)
 
     # 타일 식별자(R###_C###) 추출
@@ -623,6 +643,85 @@ def find_counterpart_image(file_path):
     for ext in ImageViewer.IMAGE_EXTENSIONS:
         counterpart = f"{target_dir}/{target_folder}_{tile}{ext}"
         if os.path.exists(counterpart):
+            return counterpart
+
+    return None
+
+
+# _REG_###### 인덱스로 짝을 찾는 형제 폴더 쌍.
+# 이 폴더들은 파일명 접두사가 서로 달라(SAR은 K5_..., EO는 K3A_...)
+# 대응 파일명을 조립할 수 없고, 인덱스로 탐색해야 한다.
+REG_INDEX_FOLDER_PAIRS = (('SAR', 'EO'),)
+
+
+def _find_reg_index_counterpart(normalized):
+    """SAR ↔ EO: 같은 부모 아래 형제 폴더에서 _REG_###### 인덱스로 짝을 찾는다.
+
+    예) .../K5_20190522094059/SAR/K5_20190522094059_REG_000001.png
+      ↔ .../K5_20190522094059/EO/K3A_20200320050332_REG_000001.png
+
+    인덱스는 자릿수 표기 차이(_REG_000001 vs _REG_1)를 흡수하도록 정수로
+    비교한다. 후보가 둘 이상이면 어느 쪽이 짝인지 특정할 수 없으므로
+    자동으로 열지 않는다.
+    """
+    basename = os.path.basename(normalized)
+
+    match = re.search(r'_REG_(\d+)', basename, re.IGNORECASE)
+    if not match:
+        return None
+    index = int(match.group(1))
+
+    src_dir = os.path.dirname(normalized)
+    parent_dir = os.path.dirname(src_dir)
+    src_folder = os.path.basename(src_dir)
+
+    # 현재 폴더가 쌍의 어느 쪽인지 판별하고 반대쪽 폴더명을 얻는다
+    target_folder = None
+    for first, second in REG_INDEX_FOLDER_PAIRS:
+        if src_folder.lower() == first.lower():
+            target_folder = second
+            break
+        if src_folder.lower() == second.lower():
+            target_folder = first
+            break
+    if target_folder is None:
+        return None
+
+    target_dir = _resolve_sibling_dir(parent_dir, target_folder)
+    if target_dir is None:
+        return None
+
+    try:
+        entries = sorted(os.listdir(target_dir))
+    except OSError:
+        return None
+
+    candidates = []
+    for entry in entries:
+        if not entry.lower().endswith(ImageViewer.IMAGE_EXTENSIONS):
+            continue
+        entry_match = re.search(r'_REG_(\d+)', entry, re.IGNORECASE)
+        if entry_match and int(entry_match.group(1)) == index:
+            candidates.append(f"{target_dir}/{entry}")
+
+    # 짝이 유일할 때만 연다
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def find_counterpart_image(file_path):
+    """열려 있는 이미지의 대응 이미지 경로를 반환. 못 찾으면 None.
+
+    두 가지 폴더 규칙을 순서대로 시도한다.
+      1) neonsat_L1G ↔ google_ref : 타일 식별자(R###_C###)로 매칭
+      2) SAR ↔ EO                 : _REG_###### 인덱스로 매칭
+    """
+    normalized = file_path.replace('\\', '/')
+
+    for finder in (_find_tile_counterpart, _find_reg_index_counterpart):
+        counterpart = finder(normalized)
+        if counterpart:
             # 원래 OS의 경로 구분자로 복원
             if '\\' in file_path:
                 counterpart = counterpart.replace('/', '\\')
