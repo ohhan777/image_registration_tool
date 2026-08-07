@@ -6,11 +6,13 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.imageformats.tiff=false")
 
 import sys
 import typing
+import contextlib
 import numpy as np
-from PyQt6.QtCore import Qt, QPointF, QRectF
+from PyQt6.QtCore import Qt, QPointF, QRectF, QSettings
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsTextItem,
-    QToolBar, QFileDialog, QInputDialog, QLineEdit, QMessageBox
+    QToolBar, QFileDialog, QInputDialog, QLineEdit, QMessageBox,
+    QSlider, QLabel, QWidget, QSizePolicy, QPushButton
 )
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QIcon, QAction, QKeySequence, QPainterPath
 from PIL import Image, ImageDraw, ImageFont
@@ -18,6 +20,25 @@ import re
 
 import cv2
 from PyQt6.QtGui import QImage
+
+# 밝기/대비 값을 창별로 기억해 두는 설정 저장소 (재실행 시 복원)
+SETTINGS_ORG = 'KARI'
+SETTINGS_APP = 'ImageRegistrationTool'
+
+
+def _build_adjust_lut(brightness, contrast):
+    """밝기/대비 슬라이더 값(-100~100)을 8비트 룩업테이블로 만든다.
+
+    대비는 128을 중심으로 기울기를 바꾸고, 밝기는 그 뒤에 오프셋을 더한다.
+    둘 다 0이면 항등 변환이다. 슬라이더 한 칸이 DN 2.55에 해당하므로
+    ±100에서 전체 범위(±255)를 덮는다.
+    """
+    c = contrast * 2.55
+    factor = (259.0 * (c + 255.0)) / (255.0 * (259.0 - c))
+    x = np.arange(256, dtype=np.float32)
+    y = factor * (x - 128.0) + 128.0 + brightness * 2.55
+    return np.clip(y, 0, 255).astype(np.uint8)
+
 
 class ImageViewer(QGraphicsView):
     IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tif', '.tiff')
@@ -68,6 +89,13 @@ class ImageViewer(QGraphicsView):
         # Undo 관련 변수
         self.undo_stack = []
 
+        # 밝기/대비 조정 (화면 표시 전용).
+        # _source_pixmap/_source_rgb는 조정 전 원본이며, 저장과 정합은 이쪽을 쓴다.
+        self._source_pixmap = None
+        self._source_rgb = None
+        self._brightness = 0
+        self._contrast = 0
+
     def _mark_dirty(self, dirty=True):
         self._dirty = dirty
         window = self.window()
@@ -87,8 +115,9 @@ class ImageViewer(QGraphicsView):
         if image.hasAlphaChannel():
             image = image.convertToFormat(QImage.Format.Format_RGB32)
         pixmap = QPixmap.fromImage(image)
+        self._set_source(pixmap)
         if not pixmap.isNull():
-            self.image_item = QGraphicsPixmapItem(pixmap)
+            self.image_item = QGraphicsPixmapItem(self._adjusted_pixmap())
             self.scene.addItem(self.image_item)
 
             self.setSceneRect(pixmap.rect().x(), pixmap.rect().y(), pixmap.rect().width(), pixmap.rect().height())
@@ -109,11 +138,75 @@ class ImageViewer(QGraphicsView):
         self.number_items.clear()
         self.coordinates.clear()
         self.number_count = 0
-        self.image_item = QGraphicsPixmapItem(pixmap)
+        self._set_source(pixmap)
+        self.image_item = QGraphicsPixmapItem(self._adjusted_pixmap())
         self.scene.addItem(self.image_item)
         self.setSceneRect(QRectF(pixmap.rect()))
         self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         self._mark_dirty(False)
+
+    # ----- 밝기/대비 조정 (화면 표시 전용) -----
+
+    def _set_source(self, pixmap):
+        """조정 전 원본 픽스맵을 보관한다. RGB 배열은 첫 조정 때 만든다."""
+        self._source_pixmap = None if pixmap.isNull() else pixmap
+        self._source_rgb = None
+
+    def _source_rgb_array(self):
+        """원본 픽스맵을 (h, w, 3) uint8 RGB 배열로 변환해 캐시한다."""
+        if self._source_rgb is None and self._source_pixmap is not None:
+            image = self._source_pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
+            height, width, stride = image.height(), image.width(), image.bytesPerLine()
+            bits = image.constBits()
+            bits.setsize(height * stride)
+            # stride는 4바이트 정렬이라 width*3보다 클 수 있다.
+            # 행 단위로 먼저 자른 뒤 (h, w, 3)으로 편다.
+            rows = np.frombuffer(bits, np.uint8).reshape(height, stride)
+            self._source_rgb = rows[:, :width * 3].reshape(height, width, 3).copy()
+        return self._source_rgb
+
+    def _adjusted_pixmap(self):
+        """현재 밝기/대비를 적용한 픽스맵. 조정값이 0이면 원본을 그대로 쓴다."""
+        if self._source_pixmap is None:
+            return QPixmap()
+        if self._brightness == 0 and self._contrast == 0:
+            return self._source_pixmap
+
+        rgb = self._source_rgb_array()
+        if rgb is None:
+            return self._source_pixmap
+
+        adjusted = np.ascontiguousarray(_build_adjust_lut(self._brightness, self._contrast)[rgb])
+        height, width, _ = adjusted.shape
+        buffer = adjusted.tobytes()  # QImage가 복사하지 않으므로 참조를 유지한다
+        image = QImage(buffer, width, height, 3 * width, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(image)
+
+    def set_adjustment(self, brightness, contrast):
+        """밝기/대비를 -100~100 범위로 설정하고 화면을 갱신한다."""
+        self._brightness = brightness
+        self._contrast = contrast
+        if self.image_item is not None and self._source_pixmap is not None:
+            self.image_item.setPixmap(self._adjusted_pixmap())
+
+    def source_pixmap(self):
+        """조정 전 원본 픽스맵. 정합 입력으로 쓴다."""
+        if self._source_pixmap is not None:
+            return self._source_pixmap
+        return self.image_item.pixmap() if self.image_item is not None else QPixmap()
+
+    @contextlib.contextmanager
+    def showing_source_pixmap(self):
+        """저장용 렌더링 동안만 원본 픽셀을 표시한다."""
+        if self.image_item is None or self._source_pixmap is None:
+            yield
+            return
+        adjusted = self.image_item.pixmap()
+        self.image_item.setPixmap(self._source_pixmap)
+        try:
+            yield
+        finally:
+            self.image_item.setPixmap(adjusted)
 
     # 좌표 저장
     def save_coordinates_image(self, file_name):
@@ -774,8 +867,11 @@ def _create_lock_icon(locked):
 
 
 class Image_Window(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings_key=None):
         super().__init__()
+        # settings_key가 있는 창만 밝기/대비를 저장·복원한다.
+        # 오버레이 결과 창처럼 일시적인 창은 None으로 두어 값을 남기지 않는다.
+        self._settings_key = settings_key
         self.viewer = ImageViewer()
         self.setCentralWidget(self.viewer)
         self.folder_name = None
@@ -867,7 +963,88 @@ class Image_Window(QMainWindow):
         exit_Action.triggered.connect(self.confirm_exit_application)
         toolbar.addAction(exit_Action)
 
+        self.add_adjust_controls(toolbar)
+
         self.statusBar()
+
+    def add_adjust_controls(self, toolbar):
+        """툴바 오른쪽 끝에 밝기/대비 슬라이더를 붙인다 (창마다 독립)."""
+        # 신축 여백을 넣어 이후 위젯을 오른쪽으로 민다
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(spacer)
+
+        self.brightness_slider, self.brightness_value = self._add_adjust_slider(toolbar, 'Brightness')
+        self.contrast_slider, self.contrast_value = self._add_adjust_slider(toolbar, 'Contrast')
+
+        reset_button = QPushButton('Reset')
+        reset_button.setToolTip('밝기/대비를 원본으로 되돌립니다')
+        reset_button.clicked.connect(self.reset_adjustment)
+        toolbar.addWidget(reset_button)
+
+        self._restore_adjustment()
+
+    def _add_adjust_slider(self, toolbar, label_text):
+        """라벨 + 슬라이더 + 현재값 라벨 한 벌을 툴바에 추가한다."""
+        label = QLabel(f' {label_text} ')
+        toolbar.addWidget(label)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(-100, 100)
+        slider.setValue(0)
+        slider.setFixedWidth(120)
+        slider.setToolTip(f'{label_text} (-100 ~ 100). 화면 표시에만 적용됩니다')
+        slider.valueChanged.connect(self._on_adjust_changed)
+        toolbar.addWidget(slider)
+
+        # 값 표시 폭을 고정해 슬라이더가 움직일 때 툴바가 흔들리지 않게 한다
+        value_label = QLabel('0')
+        value_label.setFixedWidth(32)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        toolbar.addWidget(value_label)
+
+        return slider, value_label
+
+    def _on_adjust_changed(self):
+        brightness = self.brightness_slider.value()
+        contrast = self.contrast_slider.value()
+        self.brightness_value.setText(str(brightness))
+        self.contrast_value.setText(str(contrast))
+        self.viewer.set_adjustment(brightness, contrast)
+        self._save_adjustment(brightness, contrast)
+
+    def reset_adjustment(self):
+        self._set_sliders(0, 0)
+
+    def _set_sliders(self, brightness, contrast):
+        """슬라이더를 조용히 옮긴 뒤 한 번만 반영한다 (중간값 저장 방지)."""
+        for slider, value in ((self.brightness_slider, brightness),
+                              (self.contrast_slider, contrast)):
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+        self._on_adjust_changed()
+
+    def _save_adjustment(self, brightness, contrast):
+        if not self._settings_key:
+            return
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.setValue(f'{self._settings_key}/brightness', brightness)
+        settings.setValue(f'{self._settings_key}/contrast', contrast)
+
+    def _restore_adjustment(self):
+        """지난 실행에서 쓰던 밝기/대비를 복원한다. 없으면 0으로 둔다."""
+        if not self._settings_key:
+            return
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        try:
+            brightness = int(settings.value(f'{self._settings_key}/brightness', 0))
+            contrast = int(settings.value(f'{self._settings_key}/contrast', 0))
+        except (TypeError, ValueError):
+            # 설정 파일이 손상돼도 실행은 막지 않는다
+            brightness = contrast = 0
+        # 슬라이더 범위를 벗어난 값은 setValue가 알아서 잘라낸다
+        self._set_sliders(brightness, contrast)
 
     def open_image(self, file_name=None):
         if not file_name:
@@ -918,9 +1095,11 @@ class Image_Window(QMainWindow):
 
             painter = QPainter(pixmap)
             # 씬의 특정 영역(scene_rect)을 QPixmap의 특정 영역(pixmap.rect())에 렌더링합니다.
-            self.viewer.scene.render(painter, QRectF(pixmap.rect()), scene_rect)
+            # 밝기/대비는 보기 보조일 뿐이므로 저장은 조정 전 원본 픽셀로 한다.
+            with self.viewer.showing_source_pixmap():
+                self.viewer.scene.render(painter, QRectF(pixmap.rect()), scene_rect)
             painter.end()
-            
+
             pixmap.save(file_name)
             
     def save_coordinate_txt(self):
@@ -1207,10 +1386,10 @@ class Image_Window(QMainWindow):
 if __name__ == '__main__':
     app = QApplication(sys.argv)
 
-    Window_one = Image_Window()
+    Window_one = Image_Window(settings_key='window1')
     Window_one.show()
 
-    Window_two = Image_Window()
+    Window_two = Image_Window(settings_key='window2')
     Window_two.setWindowTitle("Image Registration Tool 2")
     Window_two.move(350, 0)
 
@@ -1268,8 +1447,9 @@ if __name__ == '__main__':
                 arr = np.frombuffer(bits, np.uint8).reshape((height, width, 4))
                 return arr[:, :, [0, 1, 2]]  # BGRA to BGR
 
-            img1 = pixmap_to_cv(Window_one.viewer.image_item.pixmap())
-            img2 = pixmap_to_cv(Window_two.viewer.image_item.pixmap())
+            # 밝기/대비는 보기 보조일 뿐이므로 정합에는 조정 전 원본을 넣는다
+            img1 = pixmap_to_cv(Window_one.viewer.source_pixmap())
+            img2 = pixmap_to_cv(Window_two.viewer.source_pixmap())
 
             transformed_img, _, registered_points2, inliers, _ = register_images(img1, img2, points1, points2, common_keys)
 
@@ -1296,8 +1476,8 @@ if __name__ == '__main__':
                 dialog.setOptions(QFileDialog.Option.DontUseNativeDialog)
                 if dialog.exec():
                     file_name = dialog.selectedFiles()[0]
-                    # Get pixmap from viewer and save
-                    pixmap = overlay_window.viewer.image_item.pixmap()
+                    # 밝기/대비 조정 전 원본 오버레이를 저장한다
+                    pixmap = overlay_window.viewer.source_pixmap()
                     pixmap.save(file_name)
             
             save_overlay_action.triggered.connect(save_overlay)
