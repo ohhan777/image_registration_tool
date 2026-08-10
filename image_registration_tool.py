@@ -633,6 +633,11 @@ class ImageViewer(QGraphicsView):
             if ok:
                 self.modify_coordinate_label(index, new_label)
             return
+
+        # 영상이 없거나 영상 바깥을 클릭하면 조용히 무시한다
+        if self.image_item is None or not self.image_item.sceneBoundingRect().contains(pos):
+            return
+
         self.Click_Coordinate(pos)
 
     def _add_marker(self, x, y, label):
