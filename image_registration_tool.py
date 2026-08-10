@@ -6,6 +6,7 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.imageformats.tiff=false")
 
 import sys
 import contextlib
+import itertools
 import re
 import numpy as np
 import cv2
@@ -151,6 +152,11 @@ def notify_points_changed():
         listener()
 
 
+# Undo 항목의 전역 순번. 어느 창의 되돌리기가 가장 최근 것인지 비교하고,
+# 정합쌍 삭제처럼 두 창에 걸친 작업을 한 그룹으로 묶어 함께 되돌리는 데 쓴다.
+_undo_sequence = itertools.count(1)
+
+
 class PointMarkerItem(QGraphicsItem):
     """줌 배율과 무관하게 항상 같은 화면 크기로 보이는 정합점 마커.
 
@@ -218,7 +224,13 @@ class PointMarkerItem(QGraphicsItem):
         radius = style.marker_size / 2.0
         painter.setPen(QPen(style.color(self._role), style.line_width))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        if self._shape == 'circle':
+        if self._shape == 'dot':
+            # 속이 찬 작은 점: 정확한 위치를 가리기 않도록 작게 그린다
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(style.color(self._role))
+            dot_radius = max(2.0, style.marker_size / 5.0)
+            painter.drawEllipse(QPointF(0.0, 0.0), dot_radius, dot_radius)
+        elif self._shape == 'circle':
             painter.drawEllipse(QPointF(0.0, 0.0), radius, radius)
         elif self._shape == 'cross':
             # 가운데를 비워 찍은 지점의 화소가 가려지지 않게 한다
@@ -426,6 +438,10 @@ class ImageViewer(QGraphicsView):
         self._left_press_pos = None
         self._left_moved = False
         self._click_drag_threshold = 4  # 이 픽셀 이상 움직이면 클릭이 아닌 드래그로 간주
+
+        # 정합점 드래그 이동용 변수
+        self._drag_index = None      # 누른 위치의 정합점 인덱스 (없으면 None)
+        self._dragging_point = False  # 실제로 드래그 이동 중인지
         
         # Undo 관련 변수
         self.undo_stack = []
@@ -596,6 +612,10 @@ class ImageViewer(QGraphicsView):
             # 실제 처리(점 찍기/레이블 편집)는 마우스 릴리스 시점으로 미룬다.
             self._left_press_pos = event.position().toPoint()
             self._left_moved = False
+            # 기존 정합점 위에서 눌렀으면 드래그로 위치를 옮길 수 있게 기억해 둔다
+            self._drag_index = None
+            if not self.read_only:
+                self._drag_index = self._hit_index(self.mapToScene(self._left_press_pos))
         elif event.button() == Qt.MouseButton.RightButton:
             pos = self.mapToScene(event.position().toPoint())
             # 창 차원의 우클릭 처리(오버레이의 정합쌍 삭제 등)가 먼저다
@@ -698,12 +718,18 @@ class ImageViewer(QGraphicsView):
         self._mark_dirty(True)
         notify_points_changed()
 
-    def remove_cross_one_item(self, index):
-        if 0 <= index < len(self.number_items):
-            self.scene.removeItem(self.number_items[index])
-            self.number_items.pop(index)
-            self._recompute_number_count()
-        notify_points_changed()
+    def _remove_index(self, index):
+        """마커와 좌표를 함께 제거한다 (알림 없음 — 호출한 쪽에서 모아 알린다).
+
+        마커만 먼저 지우고 알림을 보내면 number_items와 coordinates의 길이가
+        어긋난 상태로 리스너가 돌아 잘못된 쌍을 계산하므로, 항상 둘을 같이
+        지운 뒤에 알리도록 분리했다.
+        """
+        self.scene.removeItem(self.number_items[index])
+        self.number_items.pop(index)
+        self.coordinates.pop(index)
+        self._recompute_number_count()
+        self._mark_dirty(True)
 
     # 좌표 개별 삭제
     def remove_coordinates(self, pos):
@@ -714,35 +740,44 @@ class ImageViewer(QGraphicsView):
             return False
         # Undo를 위한 현재 상태 저장
         self.save_state_for_undo()
-        self.remove_cross_one_item(index)
-        self.coordinates.pop(index)
-        self._mark_dirty(True)
+        self._remove_index(index)
         notify_points_changed()
         return True
 
     def remove_point_by_label(self, label):
-        """레이블이 일치하는 정합점을 지운다. 지웠으면 True.
+        """레이블이 일치하는 정합점을 모두 지운다. 하나라도 지웠으면 True.
 
         정합쌍 삭제(오버레이 우클릭, Ctrl+우클릭)에서 양쪽 창에 같은
-        레이블을 지울 때 쓴다. 호출 전에 save_state_for_undo()를 불러 둘 것.
+        레이블을 지울 때 쓴다. 저장 파일에 같은 번호가 중복으로 들어 있는
+        경우가 있어, 첫 번째 것만 지우면 남은 중복이 쌍을 유지시켜 화면에
+        반영되지 않는 것처럼 보인다. 모두 지운다.
+        호출 전에 save_state_for_undo()를 불러 둘 것.
         """
         target = str(label)
-        for i, item in enumerate(self.number_items):
-            if item.toPlainText() == target:
-                self.remove_cross_one_item(i)
-                self.coordinates.pop(i)
-                self._mark_dirty(True)
-                notify_points_changed()
-                return True
-        return False
+        indices = [i for i, item in enumerate(self.number_items)
+                   if item.toPlainText() == target]
+        if not indices:
+            return False
+        for i in reversed(indices):
+            self._remove_index(i)
+        notify_points_changed()
+        return True
     
     # Undo 기능을 위한 상태 저장
-    def save_state_for_undo(self):
+    def save_state_for_undo(self, group=None):
+        """현재 상태를 되돌리기 스택에 쌓는다.
+
+        group을 주면 여러 창에 걸친 한 작업(정합쌍 삭제 등)을 같은 그룹으로
+        묶어, 오버레이 창의 Ctrl+Z가 양쪽을 함께 되돌릴 수 있다.
+        """
+        seq = next(_undo_sequence)
         # 좌표와 레이블만 남기면 마커는 언제든 다시 만들 수 있다
         state = {
             'coordinates': self.coordinates.copy(),
             'number_count': self.number_count,
             'labels': [item.toPlainText() for item in self.number_items],
+            'seq': seq,
+            'group': group if group is not None else seq,
         }
 
         self.undo_stack.append(state)
@@ -800,17 +835,40 @@ class ImageViewer(QGraphicsView):
         else:
             super().keyPressEvent(event)
 
+    def _drag_point_to(self, pos):
+        """드래그 중인 정합점을 pos(씬 좌표)로 옮기고 즉시 갱신을 알린다."""
+        if self.image_item is not None:
+            # 점이 영상 밖으로 나가지 않도록 경계 안으로 눌러 넣는다
+            rect = self.image_item.sceneBoundingRect()
+            x = min(max(pos.x(), rect.left()), rect.right())
+            y = min(max(pos.y(), rect.top()), rect.bottom())
+        else:
+            x, y = pos.x(), pos.y()
+        self.coordinates[self._drag_index] = (x, y)
+        self.number_items[self._drag_index].setPos(x, y)
+        self._mark_dirty(True)
+        # Live 오버레이/후보 추천이 따라 움직이도록 바로 알린다
+        notify_points_changed()
+
     def mouseMoveEvent(self, event):
-        # 플레인 좌클릭 후 임계값 이상 움직이면 클릭이 아닌 드래그(패닝)로 전환
+        # 플레인 좌클릭 후 임계값 이상 움직이면 클릭이 아닌 드래그로 전환.
+        # 정합점 위에서 시작했으면 점 이동, 아니면 화면 이동(패닝)이다.
         if (self._left_press_pos is not None and not self._left_moved
                 and event.buttons() & Qt.MouseButton.LeftButton):
             moved = (event.position().toPoint() - self._left_press_pos).manhattanLength()
             if moved > self._click_drag_threshold:
                 self._left_moved = True
-                self.is_panning = True
-                self.last_pan_point = event.position().toPoint()
+                if self._drag_index is not None:
+                    # 점 드래그 시작: 되돌리기 상태는 시작 시점에 한 번만 저장
+                    self._dragging_point = True
+                    self.save_state_for_undo()
+                else:
+                    self.is_panning = True
+                    self.last_pan_point = event.position().toPoint()
 
-        if self.is_panning and self.last_pan_point is not None:
+        if self._dragging_point:
+            self._drag_point_to(self.mapToScene(event.position().toPoint()))
+        elif self.is_panning and self.last_pan_point is not None:
             # 드래그 거리 계산
             delta = event.position().toPoint() - self.last_pan_point
             self.last_pan_point = event.position().toPoint()
@@ -828,7 +886,11 @@ class ImageViewer(QGraphicsView):
             self.is_panning = False
             self.last_pan_point = None
         elif event.button() == Qt.MouseButton.LeftButton:
-            if self.is_panning:
+            if self._dragging_point:
+                # 점 드래그 종료: 마지막 위치를 반영하고 상태만 정리
+                self._drag_point_to(self.mapToScene(event.position().toPoint()))
+                self._dragging_point = False
+            elif self.is_panning:
                 # 드래그였으므로 점을 찍지 않고 패닝만 종료
                 self.is_panning = False
                 self.last_pan_point = None
@@ -837,6 +899,7 @@ class ImageViewer(QGraphicsView):
                 self._handle_left_click(event)
             self._left_press_pos = None
             self._left_moved = False
+            self._drag_index = None
 
         super().mouseReleaseEvent(event)
 
@@ -907,12 +970,13 @@ class ImageViewer(QGraphicsView):
         return pen
 
     def set_suggestions(self, suggestions):
-        """정합 후보 위치들을 점선 원 + 번호로 표시한다.
+        """정합 후보 위치들을 점선 원 + 중심점 + 번호로 표시한다.
 
         suggestions: (x, y, label, radius) 목록. 좌표와 반경은 영상 픽셀
         단위라 원의 크기가 줌을 따라 변한다 — 원은 '이 영역 안에 대응점이
-        있을 것'이라는 오차 범위를 나타내기 때문이다. 번호 글자는 다른
-        마커처럼 화면 고정 크기로 보여준다.
+        있을 것'이라는 오차 범위를 나타내기 때문이다. 예상 지점 자체는
+        중심의 점으로 정확히 가리키고, 번호 글자와 함께 화면 고정 크기로
+        보여준다.
         """
         for circle, label_item in self.suggestion_items:
             self.scene.removeItem(circle)
@@ -929,8 +993,9 @@ class ImageViewer(QGraphicsView):
             circle.setZValue(9)   # 정합점 마커(10)보다는 아래
             self.scene.addItem(circle)
 
+            # 원의 중심(예상 지점)에 점을 찍고 번호를 붙인다
             label_item = PointMarkerItem(label=str(label), role='suggest',
-                                         text_role='suggest', shape='none')
+                                         text_role='suggest', shape='dot')
             label_item.setPos(x, y)
             label_item.setZValue(9)
             self.scene.addItem(label_item)
@@ -985,7 +1050,7 @@ def estimate_live_transform(points1, points2, size1, size2):
     발산하므로, 쌍 개수에 맞는 최소 모델을 쓴다.
 
       0쌍  : 배율을 맞추고(비율 유지) 두 영상의 중앙이 겹치도록 정렬
-      1쌍  : 그 점이 겹치도록 평행이동
+      1쌍  : 0쌍의 배율을 유지한 채 그 점이 겹치도록 평행이동
       2쌍  : 유사변환(회전 + 등방 스케일 + 평행이동)
       3쌍  : 어파인
       4쌍  : 최소제곱 호모그래피
@@ -993,21 +1058,22 @@ def estimate_live_transform(points1, points2, size1, size2):
 
     반환: (3x3 변환행렬, inlier 마스크 또는 None, 사용한 모델 이름)
     """
+    # 크기가 다른 두 영상을 1:1로 겹치면 절반만 겹쳐 비교할 수 없다.
+    # 0~1쌍 단계에서는 대상 영상을 기준 영상 프레임에 맞추는(비율 유지)
+    # 이 배율을 공통으로 쓴다. 쌍이 하나 생겼다고 원본 배율로 튀지 않는다.
+    (width1, height1), (width2, height2) = size1, size2
+    if width2 > 0 and height2 > 0:
+        fit_scale = min(width1 / width2, height1 / height2)
+    else:
+        fit_scale = 1.0
+    scale_suffix = '' if abs(fit_scale - 1.0) < 1e-9 else f'(배율 {fit_scale:.2f}x)'
+
     count = len(points1)
     if count == 0:
-        # 크기가 다른 두 영상을 1:1로 겹치면 절반만 겹쳐 비교할 수 없다.
-        # 대상 영상을 기준 영상 프레임에 맞춰(가로세로 비율 유지) 배율을
-        # 맞추고 중앙을 일치시킨다. 화면에는 뷰가 다시 꽉 채워 보여준다.
-        (width1, height1), (width2, height2) = size1, size2
-        if width2 > 0 and height2 > 0:
-            scale = min(width1 / width2, height1 / height2)
-        else:
-            scale = 1.0
-        matrix = np.array([[scale, 0.0, (width1 - width2 * scale) / 2.0],
-                           [0.0, scale, (height1 - height2 * scale) / 2.0],
+        matrix = np.array([[fit_scale, 0.0, (width1 - width2 * fit_scale) / 2.0],
+                           [0.0, fit_scale, (height1 - height2 * fit_scale) / 2.0],
                            [0.0, 0.0, 1.0]])
-        name = '중앙 정렬' if abs(scale - 1.0) < 1e-9 else f'중앙 정렬(배율 {scale:.2f}x)'
-        return matrix, None, name
+        return matrix, None, '중앙 정렬' + scale_suffix
 
     p1 = np.asarray(points1, dtype=np.float64).reshape(-1, 2)
     p2 = np.asarray(points2, dtype=np.float64).reshape(-1, 2)
@@ -1042,8 +1108,14 @@ def estimate_live_transform(points1, points2, size1, size2):
         if _is_usable_transform(matrix):
             return matrix, None, '유사변환(퇴화 보정)'
 
-    offset = p1[0] - p2[0]
-    return _translation_matrix(offset[0], offset[1]), None, '평행이동'
+    # 1쌍(또는 퇴화 시 최종 폴백): 0쌍 때 맞춰 둔 배율을 유지한 채,
+    # 배율 적용 후의 대응점이 겹치도록 평행이동만 더한다.
+    tx = p1[0][0] - fit_scale * p2[0][0]
+    ty = p1[0][1] - fit_scale * p2[0][1]
+    matrix = np.array([[fit_scale, 0.0, tx],
+                       [0.0, fit_scale, ty],
+                       [0.0, 0.0, 1.0]])
+    return matrix, None, '평행이동' + scale_suffix
 
 
 def warp_to_reference(moving_img, matrix, size):
@@ -1141,22 +1213,27 @@ def transform_points(points, matrix):
 
 
 def registration_status(keys, points1, registered_points2, inliers, model_name):
-    """상태 표시줄 문구: 쌍 개수, 사용한 모델, inlier 수, RMSE.
+    """상태 표시줄 문구: 쌍 개수, 사용한 모델, inlier 수, RMSE, 평균 RMSE.
 
     RANSAC이 걸러낸 outlier는 잔차가 수백 픽셀까지 나올 수 있어서, 전체
-    평균을 쓰면 정작 정합이 잘 됐는지 알 수 없다. inlier 기준으로 RMSE를
-    내고 걸러진 개수를 함께 보여 준다(outlier는 화면에서 빨간 마커).
+    평균만 쓰면 정작 정합이 잘 됐는지 알 수 없다. inlier 기준 RMSE를
+    먼저 보여주고(outlier는 화면에서 빨간 마커), outlier까지 포함한
+    전체 평균 RMSE를 함께 적어 정합점 전반의 품질도 볼 수 있게 한다.
     """
     parts = [f'정합점 {len(keys)}쌍', model_name]
     if len(keys):
-        residuals = np.linalg.norm(np.asarray(registered_points2) - np.asarray(points1), axis=1)
+        residuals_all = np.linalg.norm(
+            np.asarray(registered_points2) - np.asarray(points1), axis=1)
+        residuals = residuals_all
         if inliers is not None:
             mask = np.asarray(inliers).ravel().astype(bool)
             parts.append(f'inlier {int(mask.sum())}/{len(keys)}')
             if mask.any():
-                residuals = residuals[mask]
+                residuals = residuals_all[mask]
         rmse = float(np.sqrt(np.mean(residuals ** 2)))
         parts.append(f'RMSE {rmse:.2f} px')
+        mean_rmse = float(np.sqrt(np.mean(residuals_all ** 2)))
+        parts.append(f'평균 RMSE {mean_rmse:.2f} px')
     return ' · '.join(parts)
 
 
@@ -1485,48 +1562,46 @@ def _create_renumber_icon():
     return QIcon(pixmap)
 
 
-def _create_fit_icon():
-    """화면 맞춤: 네 귀퉁이로 뻗는 화살표."""
-    pixmap, painter = _icon_canvas()
-    painter.setPen(QPen(_ICON_INK, 2))
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.drawRect(9, 9, 14, 14)
-    painter.setPen(QPen(_ICON_ACCENT, 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-    for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
-        cx, cy = 16 + sx * 7, 16 + sy * 7
-        painter.drawLine(QPointF(cx, cy), QPointF(cx + sx * 5, cy + sy * 5))
-        painter.drawLine(QPointF(cx + sx * 5, cy + sy * 5), QPointF(cx + sx * 1, cy + sy * 5))
-        painter.drawLine(QPointF(cx + sx * 5, cy + sy * 5), QPointF(cx + sx * 5, cy + sy * 1))
-    painter.end()
-    return QIcon(pixmap)
-
-
 def _create_suggest_icon():
-    """후보 추천: 점선 원 안의 점."""
+    """후보 추천: 위치를 가리키는 지도 핀 (Live의 원형 아이콘과 혼동 방지)."""
     pixmap, painter = _icon_canvas()
-    pen = QPen(QColor(0, 170, 200), 2.2)
-    pen.setStyle(Qt.PenStyle.DashLine)
-    painter.setPen(pen)
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.drawEllipse(QPointF(16, 16), 11, 11)
+    color = QColor(0, 150, 180)
+    painter.setPen(QPen(color.darker(120), 1.6))
+    painter.setBrush(color)
+    # 핀 머리(원) + 아래로 뾰족한 꼬리
+    path = QPainterPath()
+    path.moveTo(16, 29)               # 꼬리 끝
+    path.lineTo(9.5, 15)
+    path.arcTo(QRectF(6, 3, 20, 20), 200, 140)   # 머리 위쪽 호
+    path.closeSubpath()
+    painter.drawPath(path)
+    painter.drawEllipse(QPointF(16, 13), 9, 9)
+    # 핀 구멍
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor(0, 170, 200))
-    painter.drawEllipse(QPointF(16, 16), 3, 3)
+    painter.setBrush(Qt.GlobalColor.white)
+    painter.drawEllipse(QPointF(16, 13), 3.5, 3.5)
     painter.end()
     return QIcon(pixmap)
 
 
-def _create_opacity_icon(top_filled):
-    """불투명도: 겹친 두 장 중 조절 대상만 진하게."""
+def _create_opacity_icon(number):
+    """불투명도: 겹친 두 장 중 조절 대상만 진하게 + 영상 번호 표기."""
     pixmap, painter = _icon_canvas()
-    front, back = (QColor(80, 80, 80), QColor(225, 225, 225))
-    if not top_filled:
+    front, back = (QColor(90, 90, 90), QColor(225, 225, 225))
+    if number != 1:
         front, back = back, front
     painter.setPen(QPen(_ICON_INK, 1.8))
     painter.setBrush(back)
-    painter.drawRect(13, 13, 15, 15)
+    painter.drawRect(11, 11, 14, 14)
     painter.setBrush(front)
-    painter.drawRect(4, 4, 15, 15)
+    painter.drawRect(3, 3, 14, 14)
+    # 어느 영상의 불투명도인지 큰 숫자로 구분한다
+    font = QFont()
+    font.setPixelSize(15)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.setPen(QPen(_ICON_ACCENT))
+    painter.drawText(QRectF(18, 16, 14, 16), Qt.AlignmentFlag.AlignCenter, str(number))
     painter.end()
     return QIcon(pixmap)
 
@@ -1692,12 +1767,17 @@ class Image_Window(QMainWindow):
         멀어 보인다. 한 컨테이너 안에 spacing을 직접 정해 바짝 붙인다.
         """
         group = QWidget()
+        # 툴바가 그룹을 사이즈 힌트보다 넓게 늘리면 아이콘과 슬라이더 사이가
+        # 벌어지므로, 그룹 폭을 힌트로 고정하고 남는 공간은 오른쪽으로 밀어낸다.
+        group.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         layout = QHBoxLayout(group)
-        layout.setContentsMargins(4, 0, 4, 0)
-        layout.setSpacing(2)
+        layout.setContentsMargins(2, 0, 2, 0)
+        layout.setSpacing(1)
 
         icon_label = QLabel()
-        icon_label.setPixmap(icon.pixmap(18, 18))
+        icon_label.setPixmap(icon.pixmap(20, 20))
+        icon_label.setFixedSize(21, 21)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_label.setToolTip(tooltip)
         layout.addWidget(icon_label)
 
@@ -1709,11 +1789,14 @@ class Image_Window(QMainWindow):
         slider.valueChanged.connect(on_change)
         layout.addWidget(slider)
 
-        # 값 표시 폭을 고정해 슬라이더가 움직일 때 툴바가 흔들리지 않게 한다
+        # 값 표시 폭은 고정하되(툴바 흔들림 방지) 글자는 왼쪽에 붙인다.
+        # 오른쪽 정렬이면 '0'처럼 짧은 값이 박스 끝으로 밀려나
+        # 슬라이더와 멀어 보인다.
         value_label = QLabel(str(initial))
         value_label.setFixedWidth(value_width)
-        value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(value_label)
+        layout.addStretch(1)
 
         return group, slider, value_label
 
@@ -1993,12 +2076,15 @@ class Image_Window(QMainWindow):
     def delete_pair(self, label):
         """레이블이 같은 정합점을 두 창 모두에서 지운다 (정합쌍 삭제).
 
-        한쪽에만 있는 미완성 점이라도 그 한쪽에서 지워진다.
+        한쪽에만 있는 미완성 점이라도 그 한쪽에서 지워진다. 두 창의 되돌리기
+        상태를 같은 그룹으로 묶어, 오버레이 창의 Ctrl+Z 한 번으로 양쪽이
+        함께 되돌아간다.
         """
+        group = next(_undo_sequence)
         removed = False
         for window in self._session_windows():
             viewer = window.viewer
-            viewer.save_state_for_undo()
+            viewer.save_state_for_undo(group=group)
             if viewer.remove_point_by_label(label):
                 removed = True
             else:
@@ -2006,8 +2092,28 @@ class Image_Window(QMainWindow):
                 viewer.undo_stack.pop()
         if removed:
             self.statusBar().showMessage(
-                f'정합쌍 {label}번을 양쪽에서 삭제했습니다. (각 창에서 Ctrl+Z로 되돌리기)', 5000)
+                f'정합쌍 {label}번을 양쪽에서 삭제했습니다. (Ctrl+Z로 되돌리기)', 5000)
         return removed
+
+    def undo_last_session_action(self):
+        """세션에서 가장 최근의 점 편집을 되돌린다.
+
+        두 창의 되돌리기 스택 맨 위를 비교해 최신 것을 고르고, 같은 그룹으로
+        묶인 항목(정합쌍 삭제가 양쪽에 남긴 상태)은 함께 되돌린다. 오버레이
+        창의 Ctrl+Z가 이 경로를 쓴다.
+        """
+        windows = self._session_windows()
+        tops = [(w.viewer.undo_stack[-1].get('seq', 0), w)
+                for w in windows if w.viewer.undo_stack]
+        if not tops:
+            return False
+        _, latest = max(tops, key=lambda t: t[0])
+        group = latest.viewer.undo_stack[-1].get('group')
+        for window in windows:
+            stack = window.viewer.undo_stack
+            if stack and stack[-1].get('group') == group:
+                window.viewer.undo()
+        return True
 
     def request_exit(self):
         """종료해도 되는지 한 번만 확인한다.
@@ -2177,18 +2283,19 @@ class RegistrationOverlayWindow(Image_Window):
     on_closed = None
     # 우클릭으로 정합쌍 삭제를 요청했을 때 레이블을 넘겨 부르는 콜백
     on_pair_delete = None
+    # Ctrl+Z: 원본 창들의 마지막 편집을 되돌리는 콜백 (생성한 쪽에서 지정)
+    on_undo = None
     # 'Save Overlay'의 기본 파일명
     default_save_name = 'overlay.png'
 
-    # 이 잔차(px) 미만이면 모델이 그대로 통과한 점으로 보고 노란 십자로 표시
+    # 이 잔차(px) 미만이면 모델이 그대로 통과한 점으로 본다 (노란 점)
     EXACT_RESIDUAL_EPS = 0.5
 
     def __init__(self, live=False):
         super().__init__()
         self.is_overlay = True
         self.viewer.read_only = True   # 결과 확인용 창이므로 점을 찍지 않는다
-        # 사용자가 줌/패닝을 잡으면 auto-fit을 풀고, 우클릭은 정합쌍 삭제로 쓴다
-        self.viewer.on_user_interaction = self._on_user_view_interaction
+        # 우클릭은 정합쌍 삭제로 쓴다
         self.viewer.on_right_click = self._on_viewer_right_click
         self._live = live
         self.setWindowTitle('Live Registration Overlay' if live else 'Overlay Registration Result')
@@ -2213,12 +2320,8 @@ class RegistrationOverlayWindow(Image_Window):
         self._markers = None        # (points1, registered_points2, inliers, keys)
         self._marker_items = []     # 씬에 얹은 정합점 마커
         self._flicker_mode = None   # None(합성) / 'base' / 'warped'
-        # 항상 화면을 채워 보여줄지 여부. 사용자가 직접 줌/패닝하면 풀린다.
-        self._auto_fit = True
-        # 캔버스 원점(기준 영상이 캔버스 안에서 밀려난 양). auto-fit이 꺼진
-        # 동안 캔버스 크기가 바뀌어도 보고 있던 자리를 유지하는 데 쓴다.
+        # 캔버스 원점 (set_layers가 넘겨준 값 보관용)
         self._origin = (0.0, 0.0)
-        self._shown_origin = None
 
         self._flicker_timer = QTimer(self)
         self._flicker_timer.timeout.connect(self._advance_flicker)
@@ -2226,6 +2329,8 @@ class RegistrationOverlayWindow(Image_Window):
         toolbar = QToolBar('toolbar')
         self.addToolBar(toolbar)
 
+        # 갱신될 때마다 항상 화면에 꽉 차게 다시 맞추므로 별도의 Fit 버튼은
+        # 두지 않는다. 확대/축소는 다음 갱신 전까지 임시로 살펴보는 용도.
         plus_action = QAction(QIcon('./icon/zoom_in.png'), 'Zoom In', self)
         plus_action.triggered.connect(self.zoom_in)
         toolbar.addAction(plus_action)
@@ -2233,16 +2338,6 @@ class RegistrationOverlayWindow(Image_Window):
         minus_action = QAction(QIcon('./icon/zoom_out.png'), 'Zoom Out', self)
         minus_action.triggered.connect(self.zoom_out)
         toolbar.addAction(minus_action)
-
-        # 화면 맞춤 토글: 켜져 있으면 갱신·창 크기 변경 때마다 화면을 채운다
-        self.fit_action = QAction(_create_fit_icon(), 'Fit to Window', self)
-        self.fit_action.setCheckable(True)
-        self.fit_action.setChecked(True)
-        self.fit_action.setToolTip(
-            '영상을 항상 화면에 맞춰 채웁니다.\n'
-            '직접 줌/패닝하면 꺼지며, 다시 누르면 화면에 맞춥니다.')
-        self.fit_action.toggled.connect(self._on_fit_toggled)
-        toolbar.addAction(self.fit_action)
 
         save_action = QAction(QIcon('./icon/save.png'), 'Save Overlay', self)
         save_action.setStatusTip('현재 보이는 오버레이 영상을 저장합니다')
@@ -2259,19 +2354,21 @@ class RegistrationOverlayWindow(Image_Window):
         toolbar.addWidget(spacer)
 
         self.opacity1_slider, self.opacity1_value = self._add_opacity_slider(
-            toolbar, _create_opacity_icon(top_filled=True), '기준 영상(창 1)의 불투명도')
+            toolbar, _create_opacity_icon(1), '영상 1(기준, 창 1)의 불투명도')
         self.opacity2_slider, self.opacity2_value = self._add_opacity_slider(
-            toolbar, _create_opacity_icon(top_filled=False), '정합된 영상(창 2)의 불투명도')
+            toolbar, _create_opacity_icon(2), '영상 2(정합 대상, 창 2)의 불투명도')
 
         # 정합점 표시는 기본으로 켜 두고, 영상만 보고 싶을 때 끌 수 있게 한다
         self.points_action = QAction(_create_points_icon(), 'Show Points', self)
         self.points_action.setCheckable(True)
         self.points_action.setChecked(True)
         self.points_action.setToolTip(
-            '정합점 마커를 표시합니다.\n'
-            '노란 십자 = 잔차 0(모델이 그대로 통과), 초록 원 = 잔차가 있는 inlier,\n'
-            '빨간 원 = outlier. 잔차가 있는 점만 번호와 잔차(px)를 보여줍니다.\n'
-            '마커를 우클릭하면 그 정합쌍을 양쪽 창에서 삭제하고 다시 정합합니다.')
+            '정합점을 점과 번호로 표시합니다.\n'
+            '노랑 = 판정 전(4쌍 이하, 모델이 점을 그대로 통과),\n'
+            '초록 = RANSAC(5쌍 이상)이 inlier로 판정한 점, 빨강 = outlier.\n'
+            '잔차가 있는 점은 잔차(px)도 함께 보여줍니다.\n'
+            '점을 우클릭하면 그 정합쌍을 양쪽 창에서 삭제하고 다시 정합합니다.\n'
+            'Ctrl+Z로 마지막 편집(쌍 삭제 포함)을 되돌립니다.')
         self.points_action.toggled.connect(self._on_points_toggled)
         toolbar.addAction(self.points_action)
 
@@ -2346,45 +2443,17 @@ class RegistrationOverlayWindow(Image_Window):
             return
 
         viewer = self.viewer
-        had_image = viewer.image_item is not None
-        transform = viewer.transform()
-        center = viewer.mapToScene(viewer.viewport().rect().center())
-        shift_x = self._origin[0] - self._shown_origin[0] if self._shown_origin else 0.0
-        shift_y = self._origin[1] - self._shown_origin[1] if self._shown_origin else 0.0
-
         # 씬이 새로 만들어졌으면 얹어 두었던 마커도 함께 사라진 상태다
-        rebuilt = viewer.update_from_numpy(composed)
-        if rebuilt:
+        if viewer.update_from_numpy(composed):
             self._marker_items = []
 
-        if self._auto_fit:
-            # 항상 영상 전체가 화면을 채우도록 맞춘다
-            viewer.fitInView(viewer.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-        elif had_image and (rebuilt or shift_x or shift_y):
-            # 사용자가 줌을 잡고 있는 동안에는, 캔버스 크기가 바뀌어도
-            # 보고 있던 배율과 위치를 되돌려 놓는다.
-            viewer.setTransform(transform)
-            viewer.centerOn(center.x() + shift_x, center.y() + shift_y)
-
-        self._shown_origin = self._origin
+        # 항상 영상 전체가 화면을 채우도록 맞춘다
+        viewer.fitInView(viewer.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         self._rebuild_markers()
-
-    def _on_fit_toggled(self, checked):
-        self._auto_fit = checked
-        if checked and self.viewer.image_item is not None:
-            self.viewer.fitInView(self.viewer.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-
-    def _on_user_view_interaction(self):
-        """사용자가 직접 줌/패닝하면 auto-fit을 풀어 조작을 방해하지 않는다."""
-        if self._auto_fit:
-            self.fit_action.blockSignals(True)
-            self.fit_action.setChecked(False)
-            self.fit_action.blockSignals(False)
-            self._auto_fit = False
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if getattr(self, '_auto_fit', False) and self.viewer.image_item is not None:
+        if self.viewer.image_item is not None:
             self.viewer.fitInView(self.viewer.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     def _on_viewer_right_click(self, pos, event):
@@ -2411,10 +2480,13 @@ class RegistrationOverlayWindow(Image_Window):
         영상에 그려 넣지 않고 씬 아이템으로 두기 때문에, 축소해도 마커와
         번호가 같이 작아지지 않고 불투명도/플리커링과도 섞이지 않는다.
 
-        잔차에 따라 표시가 다르다.
-          - 잔차 ≈ 0 : 모델이 그대로 통과한 점. 노란 십자, 번호 없음.
-          - inlier   : 초록 원 + 번호 + 잔차(px)
-          - outlier  : 빨간 원 + 번호 + 잔차(px)
+        모든 정합점은 작은 점 + 번호로 표시하고, 상태는 색으로 구분한다.
+          - 노랑 : 아직 판정 전. 4쌍 이하에서는 모델이 점을 그대로 통과해
+                   잔차 0이 나오므로 '맞았다'가 아니라 '검증 불가'라는 뜻이다.
+          - 초록 : RANSAC(5쌍 이상)이 inlier로 판정한 점.
+                   판정이 서면 잔차가 0에 가까워도 노랑이 아닌 초록으로 바뀐다.
+          - 빨강 : outlier로 판정된 점.
+        잔차는 눈에 띄는 크기(EPS 이상)일 때만 숫자로 함께 적는다.
         """
         for item in self._marker_items:
             self.viewer.scene.removeItem(item)
@@ -2425,18 +2497,18 @@ class RegistrationOverlayWindow(Image_Window):
 
         points1, points2, inliers, keys = self._markers
         for i, ((x1, y1), (x2, y2)) in enumerate(zip(points1, points2)):
-            is_inlier = True if inliers is None else bool(inliers[i])
             label = str(keys[i]) if keys is not None else str(i + 1)
             residual = float(np.hypot(x1 - x2, y1 - y2))
+            sub_label = f'{residual:.1f}' if residual >= self.EXACT_RESIDUAL_EPS else ''
 
-            if residual < self.EXACT_RESIDUAL_EPS:
-                # 오차 0에 가까운 점: 확정(녹색) 대신 노란 십자로, 숫자 없이
-                item = PointMarkerItem(label='', role='exact', shape='cross')
+            if inliers is None:
+                # 판정 근거가 없는 단계(4쌍 이하): 잔차 0은 통과일 뿐이라 노랑
+                role = 'exact' if residual < self.EXACT_RESIDUAL_EPS else 'inlier'
             else:
-                item = PointMarkerItem(
-                    label=label, sub_label=f'{residual:.1f}',
-                    role='inlier' if is_inlier else 'outlier',
-                    text_role='text', shape='circle')
+                # RANSAC이 판정한 단계: inlier는 잔차와 무관하게 초록
+                role = 'inlier' if bool(inliers[i]) else 'outlier'
+            item = PointMarkerItem(label=label, sub_label=sub_label,
+                                   role=role, text_role='text', shape='dot')
             item.setPos(float(x2), float(y2))
             self.viewer.scene.addItem(item)
             self._marker_items.append(item)
@@ -2486,6 +2558,13 @@ class RegistrationOverlayWindow(Image_Window):
             self._update_opacity_enabled()
             self._refresh_view()
             return
+        if (event.key() == Qt.Key.Key_Z
+                and event.modifiers() == Qt.KeyboardModifier.ControlModifier):
+            # 오버레이 창의 뷰어에는 되돌릴 것이 없다. 원본 창들의 마지막
+            # 편집(정합쌍 삭제 포함)을 되돌리도록 위임한다.
+            if self.on_undo is not None:
+                self.on_undo()
+            return
         super().keyPressEvent(event)
 
     # ----- 저장/종료 -----
@@ -2531,7 +2610,6 @@ if __name__ == '__main__':
     Window_two.partner_window = Window_one
     Window_two.show()
 
-    active_overlays = []
     # Live 오버레이 창과, 불필요한 재계산을 막기 위한 마지막 입력 지문
     live_state = {'window': None, 'signature': None}
 
@@ -2551,9 +2629,6 @@ if __name__ == '__main__':
         points1 = np.array([points1_dict[k] for k in keys], dtype=np.float64).reshape(-1, 2)
         points2 = np.array([points2_dict[k] for k in keys], dtype=np.float64).reshape(-1, 2)
         return keys, points1, points2
-
-    def get_common_count():
-        return len(common_point_pairs()[0])
 
     def compute_overlay_state():
         """현재 영상/정합점으로 오버레이 레이어 일체를 계산한다.
@@ -2709,8 +2784,7 @@ if __name__ == '__main__':
         Window_two.viewer.set_suggestions(suggestions2)
 
     def update_after_points_change():
-        """정합점이 바뀔 때마다: 정합 버튼 상태, Live 오버레이, 후보 추천 갱신."""
-        reg_action.setEnabled(get_common_count() >= 5)
+        """정합점이 바뀔 때마다: Live 오버레이, 후보 추천 갱신."""
         try:
             refresh_live_overlay()
         except Exception as exc:
@@ -2721,13 +2795,9 @@ if __name__ == '__main__':
         except Exception as exc:
             Window_two.statusBar().showMessage(f'후보 추천 실패: {exc}', 5000)
 
-    # Add registration button to Window_two's toolbar
+    # Live 토글: 켜면 정합점이 바뀔 때마다 오버레이가 즉시 갱신된다.
+    # (예전의 '정합' 버튼은 Live 뷰가 같은 계산을 실시간으로 대체하므로 없앴다)
     toolbar = Window_two.findChild(QToolBar)
-    reg_action = QAction(QIcon('./icon/reg_img.png'), "Perform Registration", Window_two)
-    reg_action.setStatusTip("Register images and show overlay")
-    toolbar.addAction(reg_action)
-
-    # 정합 버튼 옆의 Live 토글: 켜면 정합점이 바뀔 때마다 오버레이가 즉시 갱신된다
     live_action = QAction(_create_live_icon(), 'Live Preview', Window_two)
     live_action.setCheckable(True)
     live_action.setToolTip(
@@ -2764,6 +2834,8 @@ if __name__ == '__main__':
                 # 마커 우클릭 → 양쪽에서 쌍 삭제. 삭제가 notify를 부르므로
                 # 남은 쌍으로의 재정합은 자동으로 반영된다.
                 window.on_pair_delete = Window_two.delete_pair
+                # Ctrl+Z → 원본 창들의 마지막 편집(쌍 삭제 포함)을 되돌린다
+                window.on_undo = Window_two.undo_last_session_action
                 live_state['window'] = window
                 window.show()
             refresh_live_overlay(force=True)
@@ -2773,47 +2845,7 @@ if __name__ == '__main__':
 
     live_action.toggled.connect(toggle_live)
 
-    def make_static_pair_delete(window):
-        """정적 결과 창의 마커 우클릭: 쌍 삭제 후 그 창을 재정합해 갱신."""
-        def handler(label):
-            if not Window_two.delete_pair(label):
-                return
-            try:
-                apply_overlay_state(window)
-            except Exception as exc:
-                window.statusBar().showMessage(f'재정합 실패: {exc}', 5000)
-        return handler
-
-    def registration_func():
-        try:
-            if Window_one.viewer.image_item is None or Window_two.viewer.image_item is None:
-                QMessageBox.warning(Window_two, "Error", "Both windows must have images loaded.")
-                return
-
-            # 정합 전 정합점 무결성 검사 (개수 일치, 중복 없음, 1:1 매핑)
-            ok, message = Window_two.check_pair_integrity()
-            if not ok:
-                Window_two._show_integrity_warning(message)
-                return
-
-            if get_common_count() < 5:
-                QMessageBox.warning(Window_two, "Error", "At least 5 common points required.")
-                return
-
-            overlay_window = RegistrationOverlayWindow()
-            overlay_window.default_save_name = (
-                f"{Window_two.folder_name}_overlay.png" if Window_two.folder_name else 'overlay.png')
-            overlay_window.on_closed = lambda window: (
-                active_overlays.remove(window) if window in active_overlays else None)
-            overlay_window.on_pair_delete = make_static_pair_delete(overlay_window)
-            apply_overlay_state(overlay_window)
-            overlay_window.show()
-            active_overlays.append(overlay_window)
-        except Exception as e:
-            QMessageBox.critical(Window_two, "Error", str(e))
-
-    reg_action.triggered.connect(registration_func)
-    # 정합점이 바뀔 때마다 버튼 상태/Live/후보 추천을 갱신한다
+    # 정합점이 바뀔 때마다 Live/후보 추천을 갱신한다
     on_points_changed(update_after_points_change)
     update_after_points_change()
 
