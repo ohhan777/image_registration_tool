@@ -15,10 +15,11 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsItem,
     QGraphicsEllipseItem, QToolBar, QFileDialog, QInputDialog, QLineEdit, QMessageBox,
     QSlider, QLabel, QWidget, QSizePolicy, QPushButton, QDoubleSpinBox,
-    QDialog, QFormLayout, QHBoxLayout, QSpinBox, QColorDialog
+    QDialog, QFormLayout, QHBoxLayout, QSpinBox, QColorDialog, QToolTip
 )
 from PyQt6.QtGui import (
-    QPixmap, QPainter, QPen, QColor, QFont, QFontMetricsF, QIcon, QAction, QPainterPath, QImage
+    QPixmap, QPainter, QPen, QColor, QFont, QFontMetricsF, QIcon, QAction, QPainterPath, QImage,
+    QCursor
 )
 
 # 밝기/대비 값을 창별로 기억해 두는 설정 저장소 (재실행 시 복원)
@@ -433,6 +434,8 @@ class ImageViewer(QGraphicsView):
         self.on_user_interaction = None
         # 우클릭을 창 차원에서 가로채는 콜백. True를 돌려주면 기본 동작을 막는다.
         self.on_right_click = None
+        # 점 드래그 중 커서 옆 풍선에 띄울 문구(현재 RMSE)를 돌려주는 콜백
+        self.drag_metrics_provider = None
 
         # 좌클릭 드래그/클릭 구분용 변수
         self._left_press_pos = None
@@ -849,6 +852,19 @@ class ImageViewer(QGraphicsView):
         self._mark_dirty(True)
         # Live 오버레이/후보 추천이 따라 움직이도록 바로 알린다
         notify_points_changed()
+        self._show_drag_balloon()
+
+    def _show_drag_balloon(self):
+        """드래그 중 커서 옆 풍선에 현재 정합 오차를 띄운다.
+
+        상태 표시줄까지 시선을 옮기지 않고도 점을 옮기면서 RMSE 변화를
+        바로 볼 수 있게 한다.
+        """
+        if self.drag_metrics_provider is None:
+            return
+        text = self.drag_metrics_provider()
+        if text:
+            QToolTip.showText(QCursor.pos(), text, self)
 
     def mouseMoveEvent(self, event):
         # 플레인 좌클릭 후 임계값 이상 움직이면 클릭이 아닌 드래그로 전환.
@@ -887,9 +903,10 @@ class ImageViewer(QGraphicsView):
             self.last_pan_point = None
         elif event.button() == Qt.MouseButton.LeftButton:
             if self._dragging_point:
-                # 점 드래그 종료: 마지막 위치를 반영하고 상태만 정리
+                # 점 드래그 종료: 마지막 위치를 반영하고 풍선을 닫는다
                 self._drag_point_to(self.mapToScene(event.position().toPoint()))
                 self._dragging_point = False
+                QToolTip.hideText()
             elif self.is_panning:
                 # 드래그였으므로 점을 찍지 않고 패닝만 종료
                 self.is_panning = False
@@ -1232,8 +1249,11 @@ def registration_status(keys, points1, registered_points2, inliers, model_name):
                 residuals = residuals_all[mask]
         rmse = float(np.sqrt(np.mean(residuals ** 2)))
         parts.append(f'RMSE {rmse:.2f} px')
-        mean_rmse = float(np.sqrt(np.mean(residuals_all ** 2)))
-        parts.append(f'평균 RMSE {mean_rmse:.2f} px')
+        if inliers is not None:
+            # 전체(outlier 포함) 기준 평균 RMSE. RANSAC 판정 전에는 모델이
+            # 점을 그대로 통과해 언제나 0이라 의미가 없으므로 적지 않는다.
+            mean_rmse = float(np.sqrt(np.mean(residuals_all ** 2)))
+            parts.append(f'평균 RMSE {mean_rmse:.2f} px')
     return ' · '.join(parts)
 
 
@@ -2419,7 +2439,8 @@ class RegistrationOverlayWindow(Image_Window):
             # 보여줄 것이 없으면 남아 있던 마커도 함께 지운다
             self._rebuild_markers()
             return
-        self._refresh_view()
+        # 정합 상태가 바뀐 갱신이므로 화면에 새로 맞춘다
+        self._refresh_view(fit=True)
 
     def _compose(self):
         """현재 불투명도/플리커링 상태에 맞는 합성 영상을 만든다."""
@@ -2437,18 +2458,26 @@ class RegistrationOverlayWindow(Image_Window):
         alpha2 = self.opacity2_slider.value() / 100.0
         return cv2.addWeighted(self._base_img, alpha1, self._warped_img, alpha2, 0)
 
-    def _refresh_view(self):
+    def _refresh_view(self, fit=False):
+        """합성 영상을 다시 그린다.
+
+        fit=True(정합 상태가 바뀐 갱신)이거나 캔버스 크기가 바뀌었을 때만
+        화면에 새로 맞춘다. 플리커링/불투명도처럼 보이는 내용만 바뀌는
+        경우에는 사용자가 잡아 둔 확대/축소 상태를 그대로 유지한다.
+        """
         composed = self._compose()
         if composed is None:
             return
 
         viewer = self.viewer
         # 씬이 새로 만들어졌으면 얹어 두었던 마커도 함께 사라진 상태다
-        if viewer.update_from_numpy(composed):
+        rebuilt = viewer.update_from_numpy(composed)
+        if rebuilt:
             self._marker_items = []
 
-        # 항상 영상 전체가 화면을 채우도록 맞춘다
-        viewer.fitInView(viewer.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        if fit or rebuilt:
+            # 영상 전체가 화면을 채우도록 맞춘다
+            viewer.fitInView(viewer.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         self._rebuild_markers()
 
     def resizeEvent(self, event):
@@ -2782,6 +2811,37 @@ if __name__ == '__main__':
 
         Window_one.viewer.set_suggestions(suggestions1)
         Window_two.viewer.set_suggestions(suggestions2)
+
+    def drag_metrics_text():
+        """드래그 풍선에 띄울 현재 정합 오차 문구.
+
+        워핑 없이 변환 추정과 잔차 계산만 하므로 마우스 이동마다 불러도
+        부담이 없다. 쌍이 없거나 영상이 없으면 빈 문자열.
+        """
+        if Window_one.viewer.image_item is None or Window_two.viewer.image_item is None:
+            return ''
+        keys, points1, points2 = common_point_pairs()
+        if not keys:
+            return ''
+        pixmap1 = Window_one.viewer.source_pixmap()
+        pixmap2 = Window_two.viewer.source_pixmap()
+        matrix, inliers, _ = estimate_live_transform(
+            points1, points2,
+            (pixmap1.width(), pixmap1.height()), (pixmap2.width(), pixmap2.height()))
+        residuals_all = np.linalg.norm(transform_points(points2, matrix) - points1, axis=1)
+        if inliers is None:
+            # 판정 전(4쌍 이하)에는 모델이 점을 그대로 통과해 RMSE가 늘 0이다
+            return f'{len(keys)}쌍 · RMSE {float(np.sqrt(np.mean(residuals_all ** 2))):.2f} px'
+        mask = inliers.ravel().astype(bool)
+        residuals = residuals_all[mask] if mask.any() else residuals_all
+        rmse = float(np.sqrt(np.mean(residuals ** 2)))
+        mean_rmse = float(np.sqrt(np.mean(residuals_all ** 2)))
+        return (f'inlier {int(mask.sum())}/{len(keys)} · RMSE {rmse:.2f} px'
+                f' · 평균 {mean_rmse:.2f} px')
+
+    # 점을 드래그하는 동안 커서 옆 풍선에 현재 오차를 보여준다
+    Window_one.viewer.drag_metrics_provider = drag_metrics_text
+    Window_two.viewer.drag_metrics_provider = drag_metrics_text
 
     def update_after_points_change():
         """정합점이 바뀔 때마다: Live 오버레이, 후보 추천 갱신."""
