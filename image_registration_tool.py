@@ -463,6 +463,7 @@ class ImageViewer(QGraphicsView):
             window.update_title()
 
     def load_image(self, file_name):
+        self._cancel_point_drag()
         self.scene.clear()
         self.number_items.clear()
         self.suggestion_items.clear()
@@ -485,6 +486,7 @@ class ImageViewer(QGraphicsView):
         notify_points_changed()
 
     def load_from_numpy(self, np_img):
+        self._cancel_point_drag()
         pixmap = _pixmap_from_bgr(np_img)
         self.scene.clear()
         self.number_items.clear()
@@ -620,6 +622,11 @@ class ImageViewer(QGraphicsView):
             if not self.read_only:
                 self._drag_index = self._hit_index(self.mapToScene(self._left_press_pos))
         elif event.button() == Qt.MouseButton.RightButton:
+            # 좌클릭(점 드래그/패닝)이 진행 중이면 우클릭을 무시한다.
+            # 드래그 중인 점이 삭제되면 남은 인덱스가 어긋나 잘못된 점을
+            # 움직이거나 범위 밖 접근으로 죽는다.
+            if self._left_press_pos is not None:
+                return
             pos = self.mapToScene(event.position().toPoint())
             # 창 차원의 우클릭 처리(오버레이의 정합쌍 삭제 등)가 먼저다
             if self.on_right_click is not None and self.on_right_click(pos, event):
@@ -712,6 +719,7 @@ class ImageViewer(QGraphicsView):
 
     # 좌표 전체 삭제
     def remove_cross_items(self):
+        self._cancel_point_drag()
         for item in self.number_items:
             self.scene.removeItem(item)
 
@@ -720,6 +728,13 @@ class ImageViewer(QGraphicsView):
         self.number_count = 0
         self._mark_dirty(True)
         notify_points_changed()
+
+    def _cancel_point_drag(self):
+        """진행 중인 점 드래그를 안전하게 끝낸다 (풍선도 닫는다)."""
+        self._drag_index = None
+        if self._dragging_point:
+            self._dragging_point = False
+            QToolTip.hideText()
 
     def _remove_index(self, index):
         """마커와 좌표를 함께 제거한다 (알림 없음 — 호출한 쪽에서 모아 알린다).
@@ -731,6 +746,12 @@ class ImageViewer(QGraphicsView):
         self.scene.removeItem(self.number_items[index])
         self.number_items.pop(index)
         self.coordinates.pop(index)
+        # 드래그 중에 목록이 줄면(예: 다른 창의 정합쌍 삭제) 대상 인덱스를 맞춘다
+        if self._drag_index is not None:
+            if index == self._drag_index:
+                self._cancel_point_drag()
+            elif index < self._drag_index:
+                self._drag_index -= 1
         self._recompute_number_count()
         self._mark_dirty(True)
 
@@ -793,6 +814,9 @@ class ImageViewer(QGraphicsView):
         if not self.undo_stack:
             return
 
+        # 마커 목록을 통째로 갈아끼우므로 진행 중인 드래그는 끝낸다
+        self._cancel_point_drag()
+
         # 현재 모든 마커 제거
         for item in self.number_items:
             self.scene.removeItem(item)
@@ -840,6 +864,11 @@ class ImageViewer(QGraphicsView):
 
     def _drag_point_to(self, pos):
         """드래그 중인 정합점을 pos(씬 좌표)로 옮기고 즉시 갱신을 알린다."""
+        # 드래그 도중 점이 지워지는 등 인덱스가 무효해졌으면 드래그를 끝낸다
+        if (self._drag_index is None
+                or not 0 <= self._drag_index < len(self.coordinates)):
+            self._cancel_point_drag()
+            return
         if self.image_item is not None:
             # 점이 영상 밖으로 나가지 않도록 경계 안으로 눌러 넣는다
             rect = self.image_item.sceneBoundingRect()
